@@ -582,7 +582,7 @@ CAMLprim value lwt_unix_mcast_modify_membership (value fd, value v_action, value
             optname = IP_ADD_MEMBERSHIP;
             break;
 
-        case VAL_MCAST_ACTION_DROP:
+        default:
             optname = IP_DROP_MEMBERSHIP;
             break;
         }
@@ -1070,9 +1070,9 @@ static value copy_stat(int use_64, struct stat *buf)
   CAMLparam0();
   CAMLlocal5(atime, mtime, ctime, offset, v);
 
-  atime = copy_double((double) buf->st_atime);
-  mtime = copy_double((double) buf->st_mtime);
-  ctime = copy_double((double) buf->st_ctime);
+  atime = copy_double((double) buf->st_atime + (NANOSEC(buf, a) / 1000000000.0));
+  mtime = copy_double((double) buf->st_mtime + (NANOSEC(buf, m) / 1000000000.0));
+  ctime = copy_double((double) buf->st_ctime + (NANOSEC(buf, c) / 1000000000.0));
   offset = use_64 ? caml_copy_int64(buf->st_size) : Val_int(buf->st_size);
   v = alloc_small(12, 0);
   Field(v, 0) = Val_int (buf->st_dev);

@@ -5,7 +5,7 @@
 OASISFormat: 0.4
 OCamlVersion: >= 4.01
 Name: lwt
-Version: 2.4.8
+Version: 2.5.0
 LicenseFile: COPYING
 License: LGPL-2.1 with OCaml linking exception
 Authors:
@@ -429,6 +429,6 @@ Test ppx
 # +-------------------------------------------------------------------+
 
 SourceRepository head
-  Type: darcs
-  Location: http://ocsigen.org/darcs/lwt
-  Browser: http://ocsigen.org/darcsweb/?r=lwt;a=summary
+  Type: git
+  Location: git://github.com/ocsigen/lwt
+  Browser: https://github.com/ocsigen/lwt
