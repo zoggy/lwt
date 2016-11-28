@@ -23,8 +23,6 @@
 
 (* This code is an adaptation of [syslog-ocaml] *)
 
-open Lwt.Infix
-
 (* Errors happening in this module are always logged to [stderr]: *)
 let log_intern fmt =
   Printf.eprintf ("Lwt_log: " ^^ fmt ^^ "\n%!")
@@ -53,7 +51,6 @@ let string_of_level = function
    | Patterns and rules                                              |
    +-----------------------------------------------------------------+ *)
 
-type pattern = string list
     (* A pattern is represented by a list of literals:
 
        For example ["foo*bar*"] is represented by ["foo"; "bar"; ""]. *)
@@ -107,13 +104,13 @@ let split pattern =
 
 let rules = ref []
 
-let load_rules str =
+let load_rules' str =
   let rec loop = function
     | [] ->
       []
     | (pattern, level) :: rest ->
       let pattern = split pattern in
-      match String.lowercase level with
+      match (String.lowercase [@ocaml.warning "-3"]) level with
         | "debug" -> (pattern, Debug) :: loop rest
         | "info" -> (pattern, Info) :: loop rest
         | "notice" -> (pattern, Notice) :: loop rest
@@ -128,7 +125,7 @@ let load_rules str =
 
 let _ =
   match try Some(Sys.getenv "LWT_LOG") with Not_found -> None with
-    | Some str -> load_rules str
+    | Some str -> load_rules' str
     | None -> ()
 
 (* +-----------------------------------------------------------------+
@@ -199,6 +196,10 @@ struct
 end
 
 type section = Section.t
+
+let load_rules str =
+  load_rules' str;
+  Section.recompute_levels ()
 
 let add_rule pattern level =
   rules := (split pattern, level) :: !rules;
@@ -277,7 +278,7 @@ let render ~buffer ~template ~section ~level ~message =
 
 let null =
   make
-    ~output:(fun section level lines -> Lwt.return_unit)
+    ~output:(fun _section _level _lines -> Lwt.return_unit)
     ~close:Lwt.return
 
 let default = ref null

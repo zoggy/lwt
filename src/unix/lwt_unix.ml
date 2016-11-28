@@ -92,7 +92,9 @@ module Notifiers = Hashtbl.Make(struct
 
 let notifiers = Notifiers.create 1024
 
-let current_notification_id = ref 0
+(* See https://github.com/ocsigen/lwt/issues/277 and
+   https://github.com/ocsigen/lwt/pull/278. *)
+let current_notification_id = ref (0x7FFFFFFF - 1000)
 
 let rec find_free_id id =
   if Notifiers.mem notifiers id then
@@ -160,23 +162,25 @@ external start_job : 'a job -> async_method -> bool = "lwt_unix_start_job"
     (* Starts the given job with given parameters. It returns [true]
        if the job is already terminated. *)
 
+[@@@ocaml.warning "-3"]
 external check_job : 'a job -> int -> bool = "lwt_unix_check_job" "noalloc"
     (* Check whether that a job has terminated or not. If it has not
        yet terminated, it is marked so it will send a notification
        when it finishes. *)
+[@@@ocaml.warning "+3"]
 
 (* For all running job, a waiter and a function to abort it. *)
 let jobs = Lwt_sequence.create ()
 
 let rec abort_jobs exn =
   match Lwt_sequence.take_opt_l jobs with
-    | Some (w, f) -> f exn; abort_jobs exn
+    | Some (_, f) -> f exn; abort_jobs exn
     | None -> ()
 
 let cancel_jobs () = abort_jobs Lwt.Canceled
 
 let wait_for_jobs () =
-  Lwt.join (Lwt_sequence.fold_l (fun (w, f) l -> w :: l) jobs [])
+  Lwt.join (Lwt_sequence.fold_l (fun (w, _) l -> w :: l) jobs [])
 
 let wrap_result f x =
   try
@@ -284,7 +288,9 @@ type file_descr = {
   (* Hooks to call when the file descriptor becomes writable. *)
 }
 
+[@@@ocaml.warning "-3"]
 external is_socket : Unix.file_descr -> bool = "lwt_unix_is_socket" "noalloc"
+[@@@ocaml.warning "+3"]
 
 external guess_blocking_job : Unix.file_descr -> bool job = "lwt_unix_guess_blocking_job"
 
@@ -347,7 +353,7 @@ let mk_ch ?blocking ?(set_flags=true) fd = {
   hooks_writable = Lwt_sequence.create ();
 }
 
-let rec check_descriptor ch =
+let check_descriptor ch =
   match ch.state with
     | Opened ->
         ()
@@ -764,7 +770,16 @@ let file_exists name =
     (fun e ->
        match e with
        | Unix.Unix_error (Unix.ENOENT, _, _) -> Lwt.return_false
-       | _ -> Lwt.fail e)
+       | _ -> Lwt.fail e) [@ocaml.warning "-4"]
+
+external utimes_job : string -> float -> float -> unit job =
+  "lwt_unix_utimes_job"
+
+let utimes path atime mtime =
+  if Sys.win32 then
+    Lwt.return (Unix.utimes path atime mtime)
+  else
+    run_job (utimes_job path atime mtime)
 
 external isatty_job : Unix.file_descr -> bool job = "lwt_unix_isatty_job"
 
@@ -851,7 +866,7 @@ struct
       (fun e ->
          match e with
          | Unix.Unix_error (Unix.ENOENT, _, _) -> Lwt.return_false
-         | _ -> Lwt.fail e)
+         | _ -> Lwt.fail e) [@ocaml.warning "-4"]
 
 end
 
@@ -1011,19 +1026,23 @@ let opendir name =
   else
     run_job (opendir_job name)
 
+external valid_dir : Unix.dir_handle -> bool = "lwt_unix_valid_dir"
 external readdir_job : Unix.dir_handle -> string job = "lwt_unix_readdir_job"
 
 let readdir handle =
   if Sys.win32 then
     Lwt.return (Unix.readdir handle)
   else
-    run_job (readdir_job handle)
+    if valid_dir handle then
+      run_job (readdir_job handle)
+    else
+      Lwt.fail (Unix.(Unix_error (EBADF, "Lwt_unix.readdir", "")))
 
 external readdir_n_job : Unix.dir_handle -> int -> string array job = "lwt_unix_readdir_n_job"
 
 let readdir_n handle count =
   if count < 0 then
-    Lwt.fail (Invalid_argument "Lwt_uinx.readdir_n")
+    Lwt.fail (Invalid_argument "Lwt_unix.readdir_n")
   else if Sys.win32 then
     let array = Array.make count "" in
     let rec fill i =
@@ -1038,7 +1057,10 @@ let readdir_n handle count =
     in
     fill 0
   else
-    run_job (readdir_n_job handle count)
+    if valid_dir handle then
+      run_job (readdir_n_job handle count)
+    else
+      Lwt.fail (Unix.(Unix_error (EBADF, "Lwt_unix.readdir_n", "")))
 
 external rewinddir_job : Unix.dir_handle -> unit job = "lwt_unix_rewinddir_job"
 
@@ -1046,15 +1068,24 @@ let rewinddir handle =
   if Sys.win32 then
     Lwt.return (Unix.rewinddir handle)
   else
-    run_job (rewinddir_job handle)
+    if valid_dir handle then
+      run_job (rewinddir_job handle)
+    else
+      Lwt.fail (Unix.(Unix_error (EBADF, "Lwt_unix.rewinddir", "")))
 
 external closedir_job : Unix.dir_handle -> unit job = "lwt_unix_closedir_job"
+external invalidate_dir : Unix.dir_handle -> unit = "lwt_unix_invalidate_dir"
 
 let closedir handle =
   if Sys.win32 then
     Lwt.return (Unix.closedir handle)
   else
-    run_job (closedir_job handle)
+    if valid_dir handle then
+      run_job (closedir_job handle) >>= fun () ->
+      invalidate_dir handle;
+      Lwt.return_unit
+    else
+      Lwt.fail (Unix.(Unix_error (EBADF, "Lwt_unix.closedir", "")))
 
 type list_directory_state  =
   | LDS_not_started
@@ -1069,6 +1100,7 @@ let cleanup_dir_handle state =
         ()
 
 let files_of_directory path =
+  let chunk_size = 1024 in
   let state = ref LDS_not_started in
   Lwt_stream.concat
     (Lwt_stream.from
@@ -1077,11 +1109,11 @@ let files_of_directory path =
             | LDS_not_started ->
                 opendir path >>= fun handle ->
                 Lwt.catch
-                  (fun () -> readdir_n handle 1024)
+                  (fun () -> readdir_n handle chunk_size)
                   (fun exn ->
                     closedir handle >>= fun () ->
                     Lwt.fail exn) >>= fun entries ->
-                if Array.length entries < 1024 then begin
+                if Array.length entries < chunk_size then begin
                   state := LDS_done;
                   closedir handle >>= fun () ->
                   Lwt.return (Some(Lwt_stream.of_array entries))
@@ -1092,11 +1124,11 @@ let files_of_directory path =
                 end
             | LDS_listing handle ->
                 Lwt.catch
-                  (fun () -> readdir_n handle 1024)
+                  (fun () -> readdir_n handle chunk_size)
                   (fun exn ->
                     closedir handle >>= fun () ->
                     Lwt.fail exn) >>= fun entries ->
-                if Array.length entries < 1024 then begin
+                if Array.length entries < chunk_size then begin
                   state := LDS_done;
                   closedir handle >>= fun () ->
                   Lwt.return (Some(Lwt_stream.of_array entries))
@@ -1362,7 +1394,7 @@ let accept_n ch n =
       wrap_syscall Read ch begin fun () ->
         begin
           try
-            for i = 1 to n do
+            for _i = 1 to n do
               if blocking && not (unix_readable ch.fd) then raise Retry;
               let fd, addr = Unix.accept ch.fd in
               l := (mk_ch ~blocking:false fd, addr) :: !l
@@ -1644,7 +1676,8 @@ let getprotobynumber number =
     Lwt_mutex.with_lock protoent_mutex ( fun () ->
         run_job (getprotobynumber_job number))
 
-let servent_mutex =
+(* TODO: Not used anywhere, and that might be a bug. *)
+let _servent_mutex =
   if Sys.win32 || Lwt_config._HAVE_NETDB_REENTRANT then
     hostent_mutex
   else
@@ -1839,14 +1872,11 @@ let tcflow ch act =
    | Reading notifications                                           |
    +-----------------------------------------------------------------+ *)
 
-(* Buffer used to receive notifications: *)
-let notification_buffer = Bytes.create 4
-
 external init_notification : unit -> Unix.file_descr = "lwt_unix_init_notification"
 external send_notification : int -> unit = "lwt_unix_send_notification_stub"
 external recv_notifications : unit -> int array = "lwt_unix_recv_notifications"
 
-let rec handle_notifications ev =
+let handle_notifications _ =
   (* Process available notifications. *)
   Array.iter call_notification (recv_notifications ())
 
@@ -1874,13 +1904,13 @@ and signal_handler_id = signal_handler option ref
 let signals = ref Signal_map.empty
 let signal_count () =
   Signal_map.fold
-    (fun signum (id, actions) len -> len + Lwt_sequence.length actions)
+    (fun _signum (_id, actions) len -> len + Lwt_sequence.length actions)
     !signals
     0
 
 let on_signal_full signum handler =
   let id = ref None in
-  let notification, actions =
+  let _, actions =
     try
       Signal_map.find signum !signals
     with Not_found ->
@@ -1904,7 +1934,7 @@ let on_signal_full signum handler =
   id := Some { sh_num = signum; sh_node = node };
   id
 
-let on_signal signum f = on_signal_full signum (fun id num -> f num)
+let on_signal signum f = on_signal_full signum (fun _id num -> f num)
 
 let disable_signal_handler id =
   match !id with
@@ -1922,7 +1952,7 @@ let disable_signal_handler id =
 
 let reinstall_signal_handler signum =
   match try Some (Signal_map.find signum !signals) with Not_found -> None with
-    | Some (notification, actions) ->
+    | Some (notification, _) ->
         set_signal signum notification
     | None ->
         ()
@@ -1943,7 +1973,7 @@ let fork () =
         (* Reinitialise the notification system. *)
         event_notifications := Lwt_engine.on_readable (init_notification ()) handle_notifications;
         (* Collect all pending jobs. *)
-        let l = Lwt_sequence.fold_l (fun (w, f) l -> f :: l) jobs [] in
+        let l = Lwt_sequence.fold_l (fun (_, f) l -> f :: l) jobs [] in
         (* Remove them all. *)
         Lwt_sequence.iter_node_l Lwt_sequence.remove jobs;
         (* And cancel them all. We yield first so that if the program
@@ -2081,10 +2111,12 @@ let handle_unix_error f x =
    | System thread pool                                              |
    +-----------------------------------------------------------------+ *)
 
+[@@@ocaml.warning "-3"]
 external pool_size : unit -> int = "lwt_unix_pool_size" "noalloc"
 external set_pool_size : int -> unit = "lwt_unix_set_pool_size" "noalloc"
 external thread_count : unit -> int = "lwt_unix_thread_count" "noalloc"
 external thread_waiting_count : unit -> int = "lwt_unix_thread_waiting_count" "noalloc"
+[@@@ocaml.warning "+3"]
 
 (* +-----------------------------------------------------------------+
    | CPUs                                                            |

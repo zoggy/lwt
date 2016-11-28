@@ -29,8 +29,6 @@
  * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  ******************************************************************************)
 
-open Lwt.Infix
-
 type 'a t = 'a Lwt.u Lwt_sequence.t
 
 let create = Lwt_sequence.create
@@ -59,3 +57,8 @@ let broadcast cvar arg =
   let wakeners = Lwt_sequence.fold_r (fun x l -> x :: l) cvar [] in
   Lwt_sequence.iter_node_l Lwt_sequence.remove cvar;
   List.iter (fun wakener -> Lwt.wakeup_later wakener arg) wakeners
+
+let broadcast_exn cvar exn =
+  let wakeners = Lwt_sequence.fold_r (fun x l -> x :: l) cvar [] in
+  Lwt_sequence.iter_node_l Lwt_sequence.remove cvar;
+  List.iter (fun wakener -> Lwt.wakeup_later_exn wakener exn) wakeners

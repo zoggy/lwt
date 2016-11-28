@@ -49,7 +49,7 @@ val unsafe_set : t -> int -> char -> unit
 
 (** {2 Conversions} *)
 
-val of_bytes : Bytes.t -> t
+val of_bytes : bytes -> t
   (** [of_bytes buf] returns a newly allocated byte array with the
       same contents as [buf]. *)
 
@@ -57,7 +57,7 @@ val of_string : string -> t
   (** [of_string buf] returns a newly allocated byte array with the
       same contents as [buf]. *)
 
-val to_bytes : t -> Bytes.t
+val to_bytes : t -> bytes
   (** [to_bytes buf] returns newly allocated bytes with the same
       contents as [buf]. *)
 
@@ -71,21 +71,21 @@ val blit : t -> int -> t -> int -> int -> unit
   (** [blit buf1 ofs1 buf2 ofs2 len] copies [len] bytes from [buf1]
       starting at offset [ofs1] to [buf2] starting at offset [ofs2]. *)
 
-val blit_from_bytes : Bytes.t -> int -> t -> int -> int -> unit
+val blit_from_bytes : bytes -> int -> t -> int -> int -> unit
   (** Same as {!blit} but the first buffer is a string instead of a byte
       array. *)
 
-val blit_to_bytes : t -> int -> Bytes.t -> int -> int -> unit
+val blit_to_bytes : t -> int -> bytes -> int -> int -> unit
   (** Same as {!blit} but the second buffer is a string instead of a byte
       array. *)
 
 val unsafe_blit : t -> int -> t -> int -> int -> unit
   (** Same as {!blit} but without bound checking. *)
 
-val unsafe_blit_from_bytes : Bytes.t -> int -> t -> int -> int -> unit
+val unsafe_blit_from_bytes : bytes -> int -> t -> int -> int -> unit
   (** Same as {!blit_string_bytes} but without bounds checking. *)
 
-val unsafe_blit_to_bytes : t -> int -> Bytes.t -> int -> int -> unit
+val unsafe_blit_to_bytes : t -> int -> bytes -> int -> int -> unit
   (** Same as {!blit_bytes_string} but without bounds checking. *)
 
 val proxy : t -> int -> int -> t
@@ -108,22 +108,29 @@ val fill : t -> int -> int -> char -> unit
       bytes of [buffer] starting at offset [offset]. *)
 
 external unsafe_fill : t -> int -> int -> char -> unit = "lwt_unix_fill_bytes" "noalloc"
+  [@@ocaml.warning "-3"]
   (** Same as {!fill} but without bounds checking. *)
 
 (** {2 IOs} *)
 
-(** The following functions behave similarly to the ones in
-    {!Lwt_unix} except they use byte arrays instead of
-    strings. *)
+(** The following functions behave similarly to the ones in {!Lwt_unix}, except
+    they use byte arrays instead of strings, and they never perform extra copies
+    of the data. *)
 
 val read : Lwt_unix.file_descr -> t -> int -> int -> int Lwt.t
 val write : Lwt_unix.file_descr -> t -> int -> int -> int Lwt.t
 
 val recv : Lwt_unix.file_descr -> t -> int -> int -> Unix.msg_flag list -> int Lwt.t
+(** Not implemented on Windows. *)
+
 val send : Lwt_unix.file_descr -> t -> int -> int -> Unix.msg_flag list -> int Lwt.t
+(** Not implemented on Windows. *)
 
 val recvfrom : Lwt_unix.file_descr -> t -> int -> int -> Unix.msg_flag list -> (int * Unix.sockaddr) Lwt.t
+(** Not implemented on Windows. *)
+
 val sendto : Lwt_unix.file_descr -> t -> int -> int -> Unix.msg_flag list -> Unix.sockaddr -> int Lwt.t
+(** Not implemented on Windows. *)
 
 type io_vector = {
   iov_buffer : t;
@@ -134,10 +141,10 @@ type io_vector = {
 val io_vector : buffer : t -> offset : int -> length : int -> io_vector
 
 val recv_msg : socket : Lwt_unix.file_descr -> io_vectors : io_vector list -> (int * Unix.file_descr list) Lwt.t
-  (** This call is not available on windows. *)
+(** Not implemented on Windows. *)
 
 val send_msg : socket : Lwt_unix.file_descr -> io_vectors : io_vector list -> fds : Unix.file_descr list -> int Lwt.t
-  (** This call is not available on windows. *)
+(** Not implemented on Windows. *)
 
 (** {2 Memory mapped files} *)
 
@@ -146,6 +153,7 @@ val map_file : fd : Unix.file_descr -> ?pos : int64 -> shared : bool -> ?size : 
       [fd] to an array of bytes. *)
 
 external mapped : t -> bool = "lwt_unix_mapped" "noalloc"
+  [@@ocaml.warning "-3"]
   (** [mapped buffer] returns [true] iff [buffer] is a memory mapped
       file. *)
 
@@ -175,10 +183,10 @@ val mincore : t -> int -> bool array -> unit
       each cases is [true] if the corresponding page is in RAM and
       [false] otherwise.
 
-      This call is not available on windows. *)
+      This call is not available on windows and cygwin. *)
 
 val wait_mincore : t -> int -> unit Lwt.t
   (** [wait_mincore buffer offset] waits until the page containing the
       byte at offset [offset] is in RAM.
 
-      This functions is not available on windows. *)
+      This functions is not available on windows and cygwin. *)

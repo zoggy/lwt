@@ -254,11 +254,11 @@ val read_lines : input_channel -> string Lwt_stream.t
   (** [read_lines ic] returns a stream holding all lines of [ic] *)
 
 val read : ?count : int -> input_channel -> string Lwt.t
-  (** [read ?count ic] reads at most [len] characters from [ic]. It
+  (** [read ?count ic] reads at most [count] characters from [ic]. It
       returns [""] if the end of input is reached. If [count] is not
       specified, it reads all bytes until the end of input. *)
 
-val read_into : input_channel -> Bytes.t -> int -> int -> int Lwt.t
+val read_into : input_channel -> bytes -> int -> int -> int Lwt.t
   (** [read_into ic buffer offset length] reads up to [length] bytes,
       stores them in [buffer] at offset [offset], and returns the
       number of bytes read.
@@ -266,7 +266,7 @@ val read_into : input_channel -> Bytes.t -> int -> int -> int Lwt.t
       Note: [read_into] does not raise [End_of_file], it returns a
       length of [0] instead. *)
 
-val read_into_exactly : input_channel -> Bytes.t -> int -> int -> unit Lwt.t
+val read_into_exactly : input_channel -> bytes -> int -> int -> unit Lwt.t
   (** [read_into_exactly ic buffer offset length] reads exactly
       [length] bytes and stores them in [buffer] at offset [offset].
 
@@ -301,7 +301,7 @@ val write_line : output_channel -> string -> unit Lwt.t
 val write_lines : output_channel -> string Lwt_stream.t -> unit Lwt.t
   (** [write_lines oc lines] writes all lines of [lines] to [oc] *)
 
-val write_from : output_channel -> Bytes.t -> int -> int -> int Lwt.t
+val write_from : output_channel -> bytes -> int -> int -> int Lwt.t
   (** [write_from oc buffer offset length] writes up to [length] bytes
       to [oc], from [buffer] at offset [offset] and returns the number
       of bytes actually written *)
@@ -309,7 +309,7 @@ val write_from : output_channel -> Bytes.t -> int -> int -> int Lwt.t
 val write_from_string : output_channel -> string -> int -> int -> int Lwt.t
   (** See {!write}. *)
 
-val write_from_exactly : output_channel -> Bytes.t -> int -> int -> unit Lwt.t
+val write_from_exactly : output_channel -> bytes -> int -> int -> unit Lwt.t
   (** [write_from_exactly oc buffer offset length] writes all [length]
       bytes from [buffer] at offset [offset] to [oc] *)
 
@@ -418,16 +418,55 @@ val establish_server :
   ?buffer_size : int ->
   ?backlog : int ->
   Unix.sockaddr -> (input_channel * output_channel -> unit) -> server
-  (** [establish_server ?fd ?buffer_size ?backlog sockaddr f] creates
-      a server which will listen for incoming connections. New
-      connections are passed to [f]. Note that [f] must not raise any
-      exception. If [fd] is not specified, a fresh file descriptor will
-      be created.
+[@@ocaml.deprecated
+"The signature and semantics of this function will soon change:
+- the callback parameter f will evaluate to a thread (-> unit Lwt.t),
+- channels will be closed automatically when that thread completes, to avoid
+  leaking file descriptors.
+This will be breaking change. See
+  https://github.com/ocsigen/lwt/pull/258
+To keep the current functionality, use Lwt_io.Versioned.establish_server_1
+To use the safer version immediately, use Lwt_io.Versioned.establish_server_2"]
+  (** [establish_server ?fd ?buffer_size ?backlog sockaddr f] creates a server
+      which listens for incoming connections. New connections are passed to [f].
 
-      [backlog] is the argument passed to [Lwt_unix.listen] *)
+      [establish_server] does not start separate threads for running [f], nor
+      close the connections passed to [f]. Thus, the skeleton of a practical
+      server based on [establish_server] might look like this:
+
+      {[
+        Lwt_io.establish_server address (fun (ic, oc) ->
+          Lwt.async (fun () ->
+
+            (* ... *)
+
+            Lwt.catch (fun () -> Lwt_io.close oc) (fun _ -> Lwt.return_unit) >>=
+            Lwt.catch (fun () -> Lwt_io.close ic) (fun _ -> Lwt.return_unit)))
+      ]}
+
+      If [fd] is not specified, a fresh file descriptor will be created for
+      listening.
+
+      [backlog] is the argument passed to [Lwt_unix.listen].
+
+      @deprecated Will be replaced by {!Versioned.establish_server_2}, which
+        closes the channels passed to [f] automatically when a thread returned
+        by [f] completes. *)
 
 val shutdown_server : server -> unit
-  (** Shutdown the given server *)
+[@@ocaml.deprecated
+"This function will soon evaluate to a thread that waits for the close system
+call to complete. This will be a breaking change for some builds. See
+  https://github.com/ocsigen/lwt/issues/259
+To keep the current signature, use Lwt_io.Versioned.shutdown_server_1
+To use the new version immediately, use Lwt_io.Versioned.shutdown_server_2"]
+  (** Closes the given server's listening socket. This function does not wait
+      for the [close] operation to actually complete. It does not affect the
+      sockets of connections that have already been accepted, i.e. passed to [f]
+      by [establish_server].
+
+      @deprecated Will be replaced by {!Versioned.shutdown_server_2}, which
+        evaluates to a thread that waits for [close] to complete. *)
 
 val lines_of_file : file_name -> string Lwt_stream.t
   (** [lines_of_file name] returns a stream of all lines of the file
@@ -540,3 +579,54 @@ val set_default_buffer_size : int -> unit
 
       @raise Invalid_argument if the given size is smaller than [16]
       or greater than [Sys.max_string_length] *)
+
+(** Versioned variants of APIs undergoing breaking changes. *)
+module Versioned :
+sig
+  val establish_server_1 :
+    ?fd : Lwt_unix.file_descr ->
+    ?buffer_size : int ->
+    ?backlog : int ->
+    Unix.sockaddr -> (input_channel * output_channel -> unit) -> server
+  [@@ocaml.deprecated
+"Deprecated in favor of Lwt_io.Versioned.establish_server_2. See
+  https://github.com/ocsigen/lwt/pull/258"]
+  (** Alias for the current {!Lwt_io.establish_server}.
+
+      @deprecated Use {!establish_server_2}. *)
+
+  val establish_server_2 :
+    ?fd : Lwt_unix.file_descr ->
+    ?buffer_size : int ->
+    ?backlog : int ->
+    Unix.sockaddr -> (input_channel * output_channel -> unit Lwt.t) -> server
+  (** [establish_server_safe ?fd ?buffer_size ?backlog sockaddr f] creates a
+      server which listens for incoming connections. New connections are passed
+      to [f]. When threads returned by [f] complete, the connections are closed
+      automatically.
+
+      The server does not wait for each thread. It begins accepting new
+      connections immediately.
+
+      If a thread raises an exception, it is passed to
+      [!Lwt.async_exception_hook]. Likewise, if the automatic [close] of a
+      connection raises an exception, it is passed to
+      [!Lwt.async_exception_hook]. To handle exceptions raised by [close], call
+      it manually inside [f]. *)
+
+  val shutdown_server_1 : server -> unit
+  [@@ocaml.deprecated
+"Deprecated in favor of Lwt_io.Versioned.shutdown_server_2. See
+  https://github.com/ocsigen/lwt/issues/259"]
+  (** Alias for the current {!Lwt_io.shutdown_server}.
+
+      @deprecated Use {!shutdown_server_2}. *)
+
+  val shutdown_server_2 : server -> unit Lwt.t
+  (** Closes the given server's listening socket. The thread returned by this
+      function waits for the underlying [close] system call to complete.
+
+      This function does not affect sockets of connections that have already
+      been accepted by the server, i.e. those passed by [establish_server] to
+      its callback [f]. *)
+end

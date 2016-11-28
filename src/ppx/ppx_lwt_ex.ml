@@ -7,11 +7,29 @@ open Ast_convenience
 
 (** {2 Convenient stuff} *)
 
-let with_loc f { txt ; loc } =
-  (f txt) [@metaloc loc]
+let with_loc f {txt ; loc = _loc} =
+  (f txt) [@metaloc _loc]
 
 let def_loc txt =
   { txt; loc = !default_loc }
+
+(** Test if a case is a catchall. *)
+let is_catchall case =
+  let rec is_catchall_pat p = match p.ppat_desc with
+    | Ppat_any | Ppat_var _ -> true
+    | Ppat_alias (p, _) -> is_catchall_pat p
+    | _ -> false
+  in
+  case.pc_guard = None && is_catchall_pat case.pc_lhs
+
+(** Add a wildcard case in there is none. Useful for exception handlers. *)
+let add_wildcard_case cases =
+  let has_wildcard =
+    List.exists is_catchall cases
+  in
+  if not has_wildcard
+  then cases @ [Exp.case [%pat? exn] [%expr Lwt.fail exn]]
+  else cases
 
 (** {3 Internal names} *)
 
@@ -36,7 +54,7 @@ let gen_name i = lwt_prefix ^ string_of_int i
 let gen_bindings l =
   let aux i binding =
     { binding with
-      pvb_pat = (pvar @@ gen_name i) [@metaloc binding.pvb_expr.pexp_loc]
+      pvb_pat = (pvar (gen_name i)) [@metaloc binding.pvb_expr.pexp_loc]
     }
   in
   List.mapi aux l
@@ -48,7 +66,7 @@ let gen_binds e_loc l e =
     | [] -> e
     | binding :: t ->
       let name = (* __ppx_lwt_$i, at the position of $x$ *)
-        (evar @@ gen_name i) [@metaloc binding.pvb_expr.pexp_loc]
+        (evar (gen_name i)) [@metaloc binding.pvb_expr.pexp_loc]
       in
       let fun_ =
         [%expr (fun [%p binding.pvb_pat] -> [%e aux (i+1) t])] [@metaloc binding.pvb_loc]
@@ -73,10 +91,10 @@ let gen_binds e_loc l e =
 let gen_top_binds vbs =
   let gen_exp vbs i =
     match vbs with
-    | { pvb_expr } :: rest ->
+    | {pvb_expr; _}::_rest ->
       if !debug then
         [%expr Lwt.backtrace_bind (fun exn -> try raise exn with exn -> exn)
-                  [%e pvb_expr] (fun [%p pvar (gen_name i)] -> gen_exp rest (i + 1))]
+                  [%e pvb_expr] (fun [%p pvar (gen_name i)] -> gen_exp _rest (i + 1))]
       else
         [%expr Lwt.bind [%e pvb_expr] (fun [%p pvar (gen_name i)] -> gen_exp rest (i + 1))]
     | [] ->
@@ -84,7 +102,7 @@ let gen_top_binds vbs =
         if i >= 0 then evar (gen_name i) :: names (i - 1) else []
       in Exp.tuple (names i)
   in
-  [Vb.mk (Pat.tuple (vbs |> List.map (fun { pvb_pat } -> pvb_pat)))
+  [Vb.mk (Pat.tuple (vbs |> List.map (fun { pvb_pat; _ } -> pvb_pat)))
          [%expr Lwt_main.run [%e gen_exp vbs 0]]]
 
 (** For expressions only *)
@@ -95,7 +113,7 @@ let lwt_expression mapper exp attributes =
   let pexp_attributes = attributes @ exp.pexp_attributes in
   match exp.pexp_desc with
 
-  (** [let%lwt $p$ = $e$ in $e'$] ≡ [Lwt.bind $e$ (fun $p$ -> $e'$)] *)
+  (* [let%lwt $p$ = $e$ in $e'$] ≡ [Lwt.bind $e$ (fun $p$ -> $e'$)] *)
   | Pexp_let (Nonrecursive, vbl , e) ->
      let new_exp =
        Exp.let_
@@ -104,34 +122,24 @@ let lwt_expression mapper exp attributes =
          (gen_binds exp.pexp_loc vbl e)
      in mapper.expr mapper { new_exp with pexp_attributes }
 
-  (** [match%lwt $e$ with $c$] ≡ [Lwt.bind $e$ (function $c$)]
-      [match%lwt $e$ with exception $x$ | $c$] ≡
-      [Lwt.try_bind (fun () -> $e$) (function $c$) (function $x$)] *)
+  (* [match%lwt $e$ with $c$] ≡ [Lwt.bind $e$ (function $c$)]
+     [match%lwt $e$ with exception $x$ | $c$] ≡
+     [Lwt.try_bind (fun () -> $e$) (function $c$) (function $x$)] *)
   | Pexp_match (e, cases) ->
     let exns, cases =
       cases |> List.partition (
         function
-        | { pc_lhs = [%pat? exception [%p? _]]} -> true
+        | {pc_lhs = [%pat? exception [%p? _]]; _} -> true
         | _ -> false)
     in
     let exns =
       exns |> List.map (
         function
-        | { pc_lhs = [%pat? exception [%p? pat]]} as case ->
+        | {pc_lhs = [%pat? exception [%p? pat]]; _} as case ->
           { case with pc_lhs = pat }
         | _ -> assert false)
     in
-    let exhaustive =
-      exns |> List.exists (
-        function
-        | { pc_lhs = [%pat? exception _]}
-        | { pc_lhs = [%pat? exception [%p? { ppat_desc = Ppat_var _ }]]} -> true
-        | _ -> false)
-    in
-    let exns =
-      if exhaustive then exns
-      else exns @ [Exp.case (Pat.var (def_loc "__pa_lwt_e")) [%expr Lwt.fail __pa_lwt_e]]
-    in
+    let exns = add_wildcard_case exns in
     let new_exp =
       match exns with
       | [] -> [%expr Lwt.bind [%e e] [%e Exp.function_ cases]]
@@ -140,42 +148,42 @@ let lwt_expression mapper exp attributes =
     in
     mapper.expr mapper { new_exp with pexp_attributes }
 
-  (** [assert%lwt $e$] ≡
-      [try Lwt.return (assert $e$) with exn -> Lwt.fail exn] *)
+  (* [assert%lwt $e$] ≡
+     [try Lwt.return (assert $e$) with exn -> Lwt.fail exn] *)
   | Pexp_assert e ->
      let new_exp =
        [%expr try Lwt.return (assert [%e e]) with exn -> Lwt.fail exn]
      in mapper.expr mapper { new_exp with pexp_attributes }
 
-  (** [while%lwt $cond$ do $body$ done] ≡
-      [let rec __ppx_lwt_loop () =
-         if $cond$ then Lwt.bind $body$ __ppx_lwt_loop
-         else Lwt.return ()
-       in __ppx_lwt_loop]
+  (* [while%lwt $cond$ do $body$ done] ≡
+     [let rec __ppx_lwt_loop () =
+        if $cond$ then Lwt.bind $body$ __ppx_lwt_loop
+        else Lwt.return_unit
+      in __ppx_lwt_loop]
    *)
   | Pexp_while (cond, body) ->
      let new_exp =
        [%expr
         let rec __ppx_lwt_loop () =
           if [%e cond] then Lwt.bind [%e body] __ppx_lwt_loop
-          else Lwt.return ()
+          else Lwt.return_unit
         in __ppx_lwt_loop ()
        ]
      in mapper.expr mapper { new_exp with pexp_attributes }
 
-  (** [for%lwt $p$ = $start$ (to|downto) $end$ do $body$ done] ≡
-      [let __ppx_lwt_bound = $end$ in
-       let rec __ppx_lwt_loop $p$ =
-         if $p$ COMP __ppx_lwt_bound then Lwt.return ()
-         else Lwt.bind $body$ (fun () -> __ppx_lwt_loop ($p$ OP 1))
-       in __ppx_lwt_loop $start$]
+  (* [for%lwt $p$ = $start$ (to|downto) $end$ do $body$ done] ≡
+     [let __ppx_lwt_bound = $end$ in
+      let rec __ppx_lwt_loop $p$ =
+        if $p$ COMP __ppx_lwt_bound then Lwt.return_unit
+        else Lwt.bind $body$ (fun () -> __ppx_lwt_loop ($p$ OP 1))
+      in __ppx_lwt_loop $start$]
    *)
-  | Pexp_for (({ ppat_desc = Ppat_var p_var} as p), start, bound, dir, body) ->
+  | Pexp_for ({ppat_desc = Ppat_var p_var; _} as p, start, bound, dir, body) ->
      let comp, op = match dir with
        | Upto ->   evar ">", evar "+"
        | Downto -> evar "<", evar "-"
      in
-     let p' = with_loc evar p_var in
+     let p' = with_loc (fun s -> evar s) p_var in
 
      let exp_bound = [%expr __ppx_lwt_bound] [@metaloc bound.pexp_loc] in
      let pat_bound = [%pat? __ppx_lwt_bound] [@metaloc bound.pexp_loc] in
@@ -184,28 +192,18 @@ let lwt_expression mapper exp attributes =
        [%expr
         let [%p pat_bound] : int = [%e bound] in
         let rec __ppx_lwt_loop [%p p] =
-          if [%e comp] [%e p'] [%e exp_bound] then Lwt.return ()
+          if [%e comp] [%e p'] [%e exp_bound] then Lwt.return_unit
           else Lwt.bind [%e body] (fun () -> __ppx_lwt_loop ([%e op] [%e p'] 1))
         in __ppx_lwt_loop [%e start]
        ]
      in mapper.expr mapper { new_exp with pexp_attributes }
 
 
-  (** [try%lwt $e$ with $c$] ≡
-      [Lwt.catch (fun () -> $e$) (function $c$)]
+  (* [try%lwt $e$ with $c$] ≡
+     [Lwt.catch (fun () -> $e$) (function $c$)]
   *)
   | Pexp_try (expr, cases) ->
-    let has_wildcard =
-      cases |> List.exists (fun case ->
-        match case.pc_lhs.ppat_desc with
-        | Ppat_any | Ppat_var _ -> true
-        | _ -> false)
-    in
-    let cases =
-      if not has_wildcard
-      then cases @ [Exp.case [%pat? exn] [%expr Lwt.fail exn]]
-      else cases
-    in
+    let cases = add_wildcard_case cases in
     let new_exp =
       if !debug then
         [%expr Lwt.backtrace_catch (fun exn -> try raise exn with exn -> exn)
@@ -215,10 +213,10 @@ let lwt_expression mapper exp attributes =
     in
     mapper.expr mapper { new_exp with pexp_attributes }
 
-  (** [if%lwt $c$ then $e1$ else $e2$] ≡
-      [match%lwt $c$ with true -> $e1$ | false -> $e2$]
-      [if%lwt $c$ then $e1$] ≡
-      [match%lwt $c$ with true -> $e1$ | false -> Lwt.return_unit]
+  (* [if%lwt $c$ then $e1$ else $e2$] ≡
+     [match%lwt $c$ with true -> $e1$ | false -> $e2$]
+     [if%lwt $c$ then $e1$] ≡
+     [match%lwt $c$ with true -> $e1$ | false -> Lwt.return_unit]
   *)
   | Pexp_ifthenelse (cond, e1, e2) ->
      let e2 = match e2 with None -> [%expr Lwt.return_unit] | Some e -> e in
@@ -231,7 +229,7 @@ let lwt_expression mapper exp attributes =
      let new_exp = [%expr Lwt.bind [%e cond] [%e Exp.function_ cases]] in
     mapper.expr mapper { new_exp with pexp_attributes }
 
-  (** [[%lwt $e$]] ≡ [Lwt.catch (fun () -> $e$) Lwt.fail] *)
+  (* [[%lwt $e$]] ≡ [Lwt.catch (fun () -> $e$) Lwt.fail] *)
   | _ ->
     let exp =
       match exp with
@@ -249,7 +247,7 @@ let lwt_expression mapper exp attributes =
     in
     mapper.expr mapper { new_exp with pexp_attributes }
 
-let make_loc { Location.loc_start } =
+let make_loc {Location.loc_start; _} =
   let (file, line, char) = Location.get_pos_info loc_start in
   [%expr ([%e str file], [%e int line], [%e int char])]
 
@@ -265,7 +263,7 @@ let make_loc { Location.loc_start } =
 let lwt_log mapper fn args attrs loc =
   let open Longident in
   match fn with
-  | { pexp_desc = Pexp_ident { txt = Ldot (Lident "Lwt_log", func) } } ->
+  | {pexp_desc = Pexp_ident {txt = Ldot (Lident "Lwt_log", func); _}; _} ->
     let len = String.length func in
     let fmt = len >= 2 && func.[len - 2] = '_' && func.[len - 1] = 'f'
     and ign = len >= 4 && func.[0] = 'i' && func.[1] = 'g' && func.[2] = 'n' && func.[3] = '_' in
@@ -276,16 +274,16 @@ let lwt_log mapper fn args attrs loc =
       | false, true  -> String.sub func 4 (len - 4)
       | true,  true  -> String.sub func 4 (len - 6)
     in
-    let level = String.capitalize level in
+    let level = (String.capitalize [@ocaml.warning "-3"]) level in
     if level = "Debug" && (not !debug) then
       let new_exp = if ign then [%expr ()] else [%expr Lwt.return_unit] in
       mapper.expr mapper { new_exp with pexp_attributes = attrs }
     else if List.mem level ["Fatal"; "Error"; "Warning"; "Notice"; "Info"; "Debug"] then
       let args = List.map (fun (l,e) -> l, mapper.expr mapper e) args in
       let new_exp =
-        let args = ("location", make_loc loc) ::
-                   ("section",  [%expr __pa_log_section]) ::
-                   List.remove_assoc "section" args in
+        let args = (Label.labelled "location", make_loc loc) ::
+                   (Label.labelled "section",  [%expr __pa_log_section]) ::
+                   List.remove_assoc (Label.labelled "section") args in
         [%expr
           if [%e Exp.construct (def_loc (Ldot (Lident "Lwt_log", level))) None] >=
                     Lwt_log.Section.level __pa_log_section then
@@ -294,7 +292,7 @@ let lwt_log mapper fn args attrs loc =
             [%e if ign then [%expr ()] else [%expr Lwt.return_unit]]]
       in
       try
-        let section = List.assoc "section" args in
+        let section = List.assoc (Label.labelled "section") args in
         [%expr let __pa_log_section = [%e section] in [%e new_exp]]
       with Not_found ->
         [%expr let __pa_log_section = Lwt_log.Section.main in [%e new_exp]]
@@ -317,8 +315,8 @@ let lwt_mapper args =
         lwt_expression mapper exp expr.pexp_attributes
 
 
-      (** [($e$)[%finally $f$]] ≡
-          [Lwt.finalize (fun () -> $e$) (fun () -> $f$)] *)
+      (* [($e$)[%finally $f$]] ≡
+         [Lwt.finalize (fun () -> $e$) (fun () -> $f$)] *)
       | [%expr [%e? exp ] [%finally     [%e? finally]] ]
       | [%expr [%e? exp ] [%lwt.finally [%e? finally]] ] ->
         let new_exp =
@@ -362,12 +360,12 @@ let lwt_mapper args =
       match stri with
       | [%stri let%lwt [%p? var] = [%e? exp]] ->
         [%stri let [%p var] = Lwt_main.run [%e mapper.expr mapper exp]]
-      | { pstr_desc = Pstr_extension (({ txt = "lwt" }, PStr [
-            { pstr_desc = Pstr_value (Recursive, vbs) }]) as content, attrs); pstr_loc } ->
-        { stri with pstr_desc =
-            Pstr_extension (content, warn_let_lwt_rec pstr_loc attrs) }
-      | { pstr_desc = Pstr_extension (({ txt = "lwt" }, PStr [
-            { pstr_desc = Pstr_value (Nonrecursive, vbs) }]), _) } ->
+      | {pstr_desc = Pstr_extension (({txt = "lwt"; _}, PStr [
+            {pstr_desc = Pstr_value (Recursive, _); _}]) as content, attrs); pstr_loc} ->
+        {stri with pstr_desc =
+            Pstr_extension (content, warn_let_lwt_rec pstr_loc attrs)}
+      | {pstr_desc = Pstr_extension (({txt = "lwt"; _}, PStr [
+            {pstr_desc = Pstr_value (Nonrecursive, vbs); _}]), _); _} ->
         mapper.structure_item mapper (Str.value Nonrecursive (gen_top_binds vbs))
       | x -> default_mapper.structure_item mapper x);
   }

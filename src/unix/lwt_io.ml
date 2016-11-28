@@ -146,9 +146,23 @@ let mode wrapper = wrapper.channel.mode
    | Creations, closing, locking, ...                                |
    +-----------------------------------------------------------------+ *)
 
+(* This strange hash function is fine because Lwt_io only ever:
+    - adds distinct channels to the hash set,
+    - folds over the hash set.
+   Lwt_io never looks up individual elements. The constant function is not
+   suitable, because then all channels will end up in the same hash bucket.
+
+   A weak hash set is used instead of a weak array to avoid having to include
+   resizing and compaction code in Lwt_io. *)
+let hash_output_channel =
+  let index = ref 0 in
+  fun () ->
+    index := !index + 1;
+    !index
+
 module Outputs = Weak.Make(struct
                              type t = output_channel
-                             let hash = Hashtbl.hash
+                             let hash _ = hash_output_channel ()
                              let equal = ( == )
                            end)
 
@@ -186,7 +200,7 @@ let is_busy ch =
 let perform_io : type mode. mode _channel -> int Lwt.t = fun ch -> match ch.main.state with
   | Busy_primitive | Busy_atomic _ -> begin
       match ch.typ with
-        | Type_normal(perform_io, seek) ->
+        | Type_normal(perform_io, _) ->
             let ptr, len = match ch.mode with
               | Input ->
                   (* Size of data in the buffer *)
@@ -206,7 +220,7 @@ let perform_io : type mode. mode _channel -> int Lwt.t = fun ch -> match ch.main
                           (function
                           | Unix.Unix_error (Unix.EPIPE, _, _) ->
                             Lwt.return 0
-                          | exn -> Lwt.fail exn)
+                          | exn -> Lwt.fail exn) [@ocaml.warning "-4"]
                       else
                         perform_io ch.buffer ptr len
                      ] >>= fun n ->
@@ -268,7 +282,7 @@ let deepest_wrapper ch =
     match wrapper.state with
       | Busy_atomic wrapper ->
           loop wrapper
-      | _ ->
+      | Busy_primitive | Waiting_for_busy | Idle | Closed | Invalid ->
           wrapper
   in
   loop ch.main
@@ -455,6 +469,11 @@ let close : type mode. mode channel -> unit Lwt.t = fun wrapper ->
             (fun _ ->
               abort wrapper)
 
+let is_closed wrapper =
+  match wrapper.state with
+  | Closed -> true
+  | Busy_primitive | Busy_atomic _ | Waiting_for_busy | Idle | Invalid -> false
+
 let flush_all () =
   let wrappers = Outputs.fold (fun x l -> x :: l) outputs [] in
   Lwt_list.iter_p
@@ -468,7 +487,7 @@ let () =
   (* Flush all opened ouput channels on exit: *)
   Lwt_main.at_exit flush_all
 
-let no_seek pos cmd =
+let no_seek _pos _cmd =
   Lwt.fail (Failure "Lwt_io.seek: seek not supported on this channel")
 
 let make :
@@ -801,7 +820,7 @@ struct
     refill ic >>= function
       | 0 ->
           Lwt.return (rev_concat (len + total_len) (str :: acc))
-      | n ->
+      | _ ->
           read_all ic (len + total_len) (str :: acc)
 
   let read count ic =
@@ -1129,12 +1148,12 @@ struct
       Lwt.return_unit
 
   let set_position : type m. m _channel -> int64 -> unit Lwt.t = fun ch pos -> match ch.typ, ch.mode with
-    | Type_normal(perform_io, seek), Output ->
+    | Type_normal(_, seek), Output ->
         flush_total ch >>= fun () ->
         do_seek seek pos >>= fun () ->
         ch.offset <- pos;
         Lwt.return_unit
-    | Type_normal(perform_io, seek), Input ->
+    | Type_normal(_, seek), Input ->
         let current = Int64.sub ch.offset (Int64.of_int (ch.max - ch.ptr)) in
         if pos >= current && pos <= ch.offset then begin
           ch.ptr <- ch.max - (Int64.to_int (Int64.sub ch.offset pos));
@@ -1155,7 +1174,7 @@ struct
         end
 
   let length ch = match ch.typ with
-    | Type_normal(perform_io, seek) ->
+    | Type_normal(_, seek) ->
         seek 0L Unix.SEEK_END >>= fun len ->
         do_seek seek ch.offset >>= fun () ->
         Lwt.return len
@@ -1289,7 +1308,7 @@ let null =
   make
     ~mode:output
     ~buffer:(Lwt_bytes.create min_buffer_size)
-    (fun str ofs len -> Lwt.return len)
+    (fun _str _ofs len -> Lwt.return len)
 
 (* Do not close standard ios on close, otherwise uncaught exceptions
    will not be printed *)
@@ -1346,26 +1365,26 @@ let with_file ?buffer ?flags ?perm ~mode filename f =
 
 let file_length filename = with_file ~mode:input filename length
 
+let close_socket fd =
+  Lwt.finalize
+    (fun () ->
+      Lwt.catch
+        (fun () ->
+          Lwt_unix.shutdown fd Unix.SHUTDOWN_ALL;
+          Lwt.return_unit)
+        (function
+        (* Occurs if the peer closes the connection first. *)
+        | Unix.Unix_error (Unix.ENOTCONN, _, _) -> Lwt.return_unit
+        | exn -> Lwt.fail exn) [@ocaml.warning "-4"])
+    (fun () ->
+      Lwt_unix.close fd)
+
 let open_connection ?fd ?in_buffer ?out_buffer sockaddr =
   let fd = match fd with
     | None -> Lwt_unix.socket (Unix.domain_of_sockaddr sockaddr) Unix.SOCK_STREAM 0
     | Some fd -> fd
   in
-  let close = lazy begin
-    Lwt.finalize
-      (fun () ->
-        Lwt.catch
-          (fun () ->
-            Lwt_unix.shutdown fd Unix.SHUTDOWN_ALL;
-            Lwt.return_unit)
-          (function
-          | Unix.Unix_error(Unix.ENOTCONN, _, _) ->
-            (* This may happen if the server closed the connection before us *)
-            Lwt.return_unit
-          | exn -> Lwt.fail exn))
-      (fun () ->
-        Lwt_unix.close fd)
-  end in
+  let close = lazy (close_socket fd) in
   Lwt.catch
     (fun () ->
       Lwt_unix.connect fd sockaddr >>= fun () ->
@@ -1382,15 +1401,23 @@ let open_connection ?fd ?in_buffer ?out_buffer sockaddr =
 
 let with_connection ?fd ?in_buffer ?out_buffer sockaddr f =
   open_connection ?fd ?in_buffer ?out_buffer sockaddr >>= fun (ic, oc) ->
+
+  (* If the user already tried to close the socket and got an exception, we
+     don't want to raise that exception again during implicit close. *)
+  let close_if_not_closed channel =
+    if is_closed channel then Lwt.return_unit else close channel in
+
   Lwt.finalize
     (fun () -> f (ic, oc))
-    (fun () -> close ic <&> close oc)
+    (fun () -> close_if_not_closed ic <&> close_if_not_closed oc)
 
 type server = {
-  shutdown : unit Lazy.t;
+  shutdown : unit Lwt.t Lazy.t;
 }
 
-let shutdown_server server = Lazy.force server.shutdown
+let shutdown_server_2 server = Lazy.force server.shutdown
+
+let shutdown_server server = Lwt.async (fun () -> shutdown_server_2 server)
 
 let establish_server ?fd ?(buffer_size = !default_buffer_size) ?(backlog=5) sockaddr f =
   let sock = match fd with
@@ -1401,15 +1428,14 @@ let establish_server ?fd ?(buffer_size = !default_buffer_size) ?(backlog=5) sock
   Lwt_unix.bind sock sockaddr;
   Lwt_unix.listen sock backlog;
   let abort_waiter, abort_wakener = Lwt.wait () in
-  let abort_waiter = abort_waiter >>= fun _ -> Lwt.return `Shutdown in
+  let abort_waiter = abort_waiter >>= fun () -> Lwt.return `Shutdown in
+  (* Signals that the listening socket has been closed. *)
+  let closed_waiter, closed_wakener = Lwt.wait () in
   let rec loop () =
     Lwt.pick [Lwt_unix.accept sock >|= (fun x -> `Accept x); abort_waiter] >>= function
-      | `Accept(fd, addr) ->
+      | `Accept(fd, _addr) ->
           (try Lwt_unix.set_close_on_exec fd with Invalid_argument _ -> ());
-          let close = lazy begin
-            Lwt_unix.shutdown fd Unix.SHUTDOWN_ALL;
-            Lwt_unix.close fd
-          end in
+          let close = lazy (close_socket fd) in
           f (of_fd ~buffer:(Lwt_bytes.create buffer_size) ~mode:input
                ~close:(fun () -> Lazy.force close) fd,
              of_fd ~buffer:(Lwt_bytes.create buffer_size) ~mode:output
@@ -1417,15 +1443,52 @@ let establish_server ?fd ?(buffer_size = !default_buffer_size) ?(backlog=5) sock
           loop ()
       | `Shutdown ->
           Lwt_unix.close sock >>= fun () ->
-          match sockaddr with
+          (match sockaddr with
             | Unix.ADDR_UNIX path when path <> "" && path.[0] <> '\x00' ->
                 Unix.unlink path;
                 Lwt.return_unit
             | _ ->
-                Lwt.return_unit
+                Lwt.return_unit) [@ocaml.warning "-4"] >>= fun () ->
+          Lwt.wakeup closed_wakener ();
+          Lwt.return_unit
   in
   ignore (loop ());
-  { shutdown = lazy(Lwt.wakeup abort_wakener `Shutdown) }
+  { shutdown = lazy (Lwt.wakeup abort_wakener (); closed_waiter) }
+
+let establish_server_safe ?fd ?buffer_size ?backlog sockaddr f =
+  let best_effort_close channel =
+    (* First, check whether the channel is closed. f may have already tried to
+       close the channel, received an exception, and handled it somehow. If so,
+       trying to close the channel here will trigger the same exception, which
+       will go to !Lwt.async_exception_hook, despite the user's efforts. *)
+    (* The Invalid state is not possible on the channel, because it was not
+       created using Lwt_io.atomic. *)
+    if is_closed channel then
+      Lwt.return_unit
+    else
+      Lwt.catch
+        (fun () -> close channel)
+        (fun exn ->
+          !Lwt.async_exception_hook exn;
+          Lwt.return_unit)
+  in
+
+  let handler ((input_channel, output_channel) as channels) =
+    Lwt.async (fun () ->
+      (* Not using Lwt.finalize here, to make sure that exceptions from [f]
+         reach !Lwt.async_exception_hook before exceptions from closing the
+         channels. *)
+      Lwt.catch
+        (fun () -> f channels)
+        (fun exn ->
+          !Lwt.async_exception_hook exn;
+          Lwt.return_unit)
+
+      >>= fun () -> best_effort_close input_channel
+      >>= fun () -> best_effort_close output_channel)
+  in
+
+  establish_server ?fd ?buffer_size ?backlog sockaddr handler
 
 let ignore_close ch =
   ignore (close ch)
@@ -1464,3 +1527,12 @@ let set_default_buffer_size size =
   check_buffer_size "set_default_buffer_size" size;
   default_buffer_size := size
 let default_buffer_size _ = !default_buffer_size
+
+module Versioned =
+struct
+  let establish_server_1 = establish_server
+  let establish_server_2 = establish_server_safe
+
+  let shutdown_server_1 = shutdown_server
+  let shutdown_server_2 = shutdown_server_2
+end

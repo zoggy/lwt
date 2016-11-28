@@ -55,8 +55,46 @@ let threads_count = ref 0
    | Preemptive threads management                                   |
    +-----------------------------------------------------------------+ *)
 
+module CELL :
+sig
+  type 'a t
+
+  val make : unit -> 'a t
+  val get : 'a t -> 'a
+  val set : 'a t -> 'a -> unit
+end =
+struct
+  type 'a t = {
+    m  : Mutex.t;
+    cv : Condition.t;
+    mutable cell : 'a option;
+  }
+
+  let make () = { m = Mutex.create (); cv = Condition.create (); cell = None }
+
+  let get t =
+    let rec await_value t =
+      match t.cell with
+        | None ->
+            Condition.wait t.cv t.m;
+            await_value t
+        | Some v ->
+            t.cell <- None;
+            Mutex.unlock t.m;
+            v
+    in
+      Mutex.lock t.m;
+      await_value t
+
+  let set t v =
+    Mutex.lock t.m;
+    t.cell <- Some v;
+    Mutex.unlock t.m;
+    Condition.signal t.cv
+end
+
 type thread = {
-  task_channel: (int * (unit -> unit)) Event.channel;
+  task_cell: (int * (unit -> unit)) CELL.t;
   (* Channel used to communicate notification id and tasks to the
      worker thread. *)
 
@@ -76,7 +114,7 @@ let waiters : thread Lwt.u Lwt_sequence.t = Lwt_sequence.create ()
 
 (* Code executed by a worker: *)
 let rec worker_loop worker =
-  let id, task = Event.sync (Event.receive worker.task_channel) in
+  let id, task = CELL.get worker.task_cell in
   task ();
   (* If there is too much threads, exit. This can happen if the user
      decreased the maximum: *)
@@ -89,7 +127,7 @@ let rec worker_loop worker =
 let make_worker () =
   incr threads_count;
   let worker = {
-    task_channel = Event.new_channel ();
+    task_cell = CELL.make ();
     thread = Thread.self ();
     reuse = true;
   } in
@@ -105,7 +143,7 @@ let add_worker worker =
         Lwt.wakeup w worker
 
 (* Wait for worker to be available, then return it: *)
-let rec get_worker () =
+let get_worker () =
   if not (Queue.is_empty workers) then
     Lwt.return (Queue.take workers)
   else if !threads_count < !max_threads then
@@ -125,7 +163,7 @@ let set_bounds (min, max) =
   min_threads := min;
   max_threads := max;
   (* Launch new workers: *)
-  for i = 1 to diff do
+  for _i = 1 to diff do
     add_worker (make_worker ())
   done
 
@@ -171,8 +209,8 @@ let detach f args =
   Lwt.finalize
     (fun () ->
       (* Send the id and the task to the worker: *)
-      Event.sync (Event.send worker.task_channel (id, task));
-      waiter)
+       CELL.set worker.task_cell (id, task);
+       waiter)
     (fun () ->
       if worker.reuse then
         (* Put back the worker to the pool: *)
@@ -188,10 +226,6 @@ let detach f args =
 (* +-----------------------------------------------------------------+
    | Running Lwt threads in the main thread                          |
    +-----------------------------------------------------------------+ *)
-
-type 'a result =
-  | Value of 'a
-  | Error of exn
 
 (* Queue of [unit -> unit Lwt.t] functions. *)
 let jobs = Queue.create ()
@@ -209,16 +243,21 @@ let job_notification =
        Mutex.unlock jobs_mutex;
        ignore (thunk ()))
 
+(* There is a potential performance issue from creating a cell every time this
+   function is called. See:
+   https://github.com/ocsigen/lwt/issues/218
+   https://github.com/ocsigen/lwt/pull/219
+   http://caml.inria.fr/mantis/view.php?id=7158 *)
 let run_in_main f =
-  let channel = Event.new_channel () in
+  let cell = CELL.make () in
   (* Create the job. *)
   let job () =
     (* Execute [f] and wait for its result. *)
     Lwt.try_bind f
-      (fun ret -> Lwt.return (Value ret))
-      (fun exn -> Lwt.return (Error exn)) >>= fun result ->
+      (fun ret -> Lwt.return (Result.Ok ret))
+      (fun exn -> Lwt.return (Result.Error exn)) >>= fun result ->
     (* Send the result. *)
-    Event.sync (Event.send channel result);
+    CELL.set cell result;
     Lwt.return_unit
   in
   (* Add the job to the queue. *)
@@ -228,6 +267,6 @@ let run_in_main f =
   (* Notify the main thread. *)
   Lwt_unix.send_notification job_notification;
   (* Wait for the result. *)
-  match Event.sync (Event.receive channel) with
-    | Value ret -> ret
-    | Error exn -> raise exn
+  match CELL.get cell with
+    | Result.Ok ret -> ret
+    | Result.Error exn -> raise exn

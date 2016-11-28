@@ -20,14 +20,21 @@
  * 02111-1307, USA.
  *)
 
-(** Syntactic sugars for lwt *)
+(** Syntactic sugars for Lwt (deprecated) *)
 
 (** This extension add the following sugars:
 
     - anonymous bind:
 
       {[
-         write stdio "Hello, " >> write stdio "world!"
+         write stdout "Hello, " >> write stdout "world!"
+      ]}
+
+      If you are mixing `>>` and `;`, you need to use parentheses or
+      `begin`/`end` to get the result you expect:
+
+      {[
+        write stdout "Hello, " >> (ignore (); write stdout "world!")
       ]}
 
     - lwt-binding:
@@ -113,6 +120,10 @@
 
     Note that the [exn -> Lwt.fail exn] branch is automatically addedd
     when needed.
+
+    Note also that [finally] is evaluated {e before} [with] if an exception is
+    raised. This is not the case with the newer PPX extension: there, [finally]
+    is always evaluated last.
 
     The construction [try_lwt <expr>] just catch regular exception
     into lwt exception. i.e. it is the same as [catch (fun _ -> <expr>) fail].

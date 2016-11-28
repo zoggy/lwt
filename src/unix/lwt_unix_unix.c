@@ -55,7 +55,7 @@ CAMLprim value lwt_unix_writable(value fd)
   pollfd.events = POLLOUT;
   pollfd.revents = 0;
   if (poll(&pollfd, 1, 0) < 0)
-    uerror("readable", Nothing);
+    uerror("writable", Nothing);
   return (Val_bool(pollfd.revents & POLLOUT));
 }
 
@@ -87,16 +87,30 @@ CAMLprim value lwt_unix_get_page_size(value Unit)
   return Val_long(page_size);
 }
 
+#ifdef __CYGWIN__
+LWT_NOT_AVAILABLE4(unix_mincore)
+#else
+
+#ifdef HAVE_BSD_MINCORE
+#   define MINCORE_VECTOR_TYPE char
+#else
+#   define MINCORE_VECTOR_TYPE unsigned char
+#endif
+
 CAMLprim value lwt_unix_mincore(value val_buffer, value val_offset, value val_length, value val_states)
 {
   long len = Wosize_val(val_states);
-  unsigned char vec[len];
+  MINCORE_VECTOR_TYPE vec[len];
   mincore((char*)Caml_ba_data_val(val_buffer) + Long_val(val_offset), Long_val(val_length), vec);
   long i;
   for (i = 0; i < len; i++)
     Field(val_states, i) = Val_bool(vec[i] & 1);
   return Val_unit;
 }
+
+#undef MINCORE_VECTOR_TYPE
+
+#endif
 
 /* +-----------------------------------------------------------------+
    | read/write                                                      |
@@ -146,7 +160,7 @@ value lwt_unix_recv(value fd, value buf, value ofs, value len, value flags)
 {
   int ret;
   ret = recv(Int_val(fd), &Byte(String_val(buf), Long_val(ofs)), Long_val(len),
-             convert_flag_list(flags, msg_flag_table));
+             caml_convert_flag_list(flags, msg_flag_table));
   if (ret == -1) uerror("recv", Nothing);
   return Val_int(ret);
 }
@@ -155,7 +169,7 @@ value lwt_unix_bytes_recv(value fd, value buf, value ofs, value len, value flags
 {
   int ret;
   ret = recv(Int_val(fd), (char*)Caml_ba_array_val(buf)->data + Long_val(ofs), Long_val(len),
-             convert_flag_list(flags, msg_flag_table));
+             caml_convert_flag_list(flags, msg_flag_table));
   if (ret == -1) uerror("recv", Nothing);
   return Val_int(ret);
 }
@@ -164,7 +178,7 @@ value lwt_unix_send(value fd, value buf, value ofs, value len, value flags)
 {
   int ret;
   ret = send(Int_val(fd), &Byte(String_val(buf), Long_val(ofs)), Long_val(len),
-             convert_flag_list(flags, msg_flag_table));
+             caml_convert_flag_list(flags, msg_flag_table));
   if (ret == -1) uerror("send", Nothing);
   return Val_int(ret);
 }
@@ -173,7 +187,7 @@ value lwt_unix_bytes_send(value fd, value buf, value ofs, value len, value flags
 {
   int ret;
   ret = send(Int_val(fd), (char*)Caml_ba_array_val(buf)->data + Long_val(ofs), Long_val(len),
-             convert_flag_list(flags, msg_flag_table));
+             caml_convert_flag_list(flags, msg_flag_table));
   if (ret == -1) uerror("send", Nothing);
   return Val_int(ret);
 }
@@ -204,7 +218,7 @@ value lwt_unix_recvfrom(value fd, value buf, value ofs, value len, value flags)
   socklen_t addr_len;
   addr_len = sizeof(addr);
   ret = recvfrom(Int_val(fd), &Byte(String_val(buf), Long_val(ofs)), Long_val(len),
-                 convert_flag_list(flags, msg_flag_table),
+                 caml_convert_flag_list(flags, msg_flag_table),
                  &addr.s_gen, &addr_len);
   if (ret == -1) uerror("recvfrom", Nothing);
   address = alloc_sockaddr(&addr, addr_len, -1);
@@ -223,7 +237,7 @@ value lwt_unix_bytes_recvfrom(value fd, value buf, value ofs, value len, value f
   socklen_t addr_len;
   addr_len = sizeof(addr);
   ret = recvfrom(Int_val(fd), (char*)Caml_ba_data_val(buf) + Long_val(ofs), Long_val(len),
-                 convert_flag_list(flags, msg_flag_table),
+                 caml_convert_flag_list(flags, msg_flag_table),
                  &addr.s_gen, &addr_len);
   if (ret == -1) uerror("recvfrom", Nothing);
   address = alloc_sockaddr(&addr, addr_len, -1);
@@ -244,7 +258,7 @@ value lwt_unix_sendto(value fd, value buf, value ofs, value len, value flags, va
   int ret;
   get_sockaddr(dest, &addr, &addr_len);
   ret = sendto(Int_val(fd), &Byte(String_val(buf), Long_val(ofs)), Long_val(len),
-               convert_flag_list(flags, msg_flag_table),
+               caml_convert_flag_list(flags, msg_flag_table),
                &addr.s_gen, addr_len);
   if (ret == -1) uerror("send", Nothing);
   return Val_int(ret);
@@ -262,7 +276,7 @@ value lwt_unix_bytes_sendto(value fd, value buf, value ofs, value len, value fla
   int ret;
   get_sockaddr(dest, &addr, &addr_len);
   ret = sendto(Int_val(fd), (char*)Caml_ba_data_val(buf) + Long_val(ofs), Long_val(len),
-               convert_flag_list(flags, msg_flag_table),
+               caml_convert_flag_list(flags, msg_flag_table),
                &addr.s_gen, addr_len);
   if (ret == -1) uerror("send", Nothing);
   return Val_int(ret);
@@ -497,7 +511,7 @@ static int socket_domain (int fd)
     case AF_INET6:
         return PF_INET6;
     default:
-        invalid_argument("Not an Internet socket");
+        caml_invalid_argument("Not an Internet socket");
     }
 
     return 0;
@@ -517,7 +531,7 @@ CAMLprim value lwt_unix_mcast_set_loop (value fd, value flag)
         r = setsockopt (Int_val(fd), IPPROTO_IP, IP_MULTICAST_LOOP, (void *) &f, sizeof(f));
         break;
     default:
-        invalid_argument("lwt_unix_mcast_set_loop");
+        caml_invalid_argument("lwt_unix_mcast_set_loop");
     };
 
     if (r == -1)
@@ -542,7 +556,7 @@ CAMLprim value lwt_unix_mcast_set_ttl (value fd, value ttl)
         r = setsockopt(fd_sock, IPPROTO_IP, IP_MULTICAST_TTL, (void *) &v, sizeof(v));
         break;
     default:
-        invalid_argument("lwt_unix_mcast_set_ttl");
+        caml_invalid_argument("lwt_unix_mcast_set_ttl");
     };
 
     if (r == -1)
@@ -571,8 +585,11 @@ CAMLprim value lwt_unix_mcast_modify_membership (value fd, value v_action, value
     case PF_INET: {
         struct ip_mreq mreq;
 
-        if (string_length(group_addr) != 4 || string_length(if_addr) != 4 )
-            invalid_argument("lwt_unix_mcast_modify: Not an IPV4 address");
+        if (caml_string_length(group_addr) != 4 ||
+            caml_string_length(if_addr) != 4) {
+
+            caml_invalid_argument("lwt_unix_mcast_modify: Not an IPV4 address");
+        }
 
         memcpy(&mreq.imr_multiaddr, &GET_INET_ADDR(group_addr), 4);
         memcpy(&mreq.imr_interface, &GET_INET_ADDR(if_addr), 4);
@@ -591,7 +608,7 @@ CAMLprim value lwt_unix_mcast_modify_membership (value fd, value v_action, value
         break;
     }
     default:
-        invalid_argument("lwt_unix_mcast_modify_membership");
+        caml_invalid_argument("lwt_unix_mcast_modify_membership");
     };
 
     if (r == -1)
@@ -631,15 +648,15 @@ static value alloc_process_status(int status)
   value st;
 
   if (WIFEXITED(status)) {
-    st = alloc_small(1, TAG_WEXITED);
+    st = caml_alloc_small(1, TAG_WEXITED);
     Field(st, 0) = Val_int(WEXITSTATUS(status));
   }
   else if (WIFSTOPPED(status)) {
-    st = alloc_small(1, TAG_WSTOPPED);
+    st = caml_alloc_small(1, TAG_WSTOPPED);
     Field(st, 0) = Val_int(caml_rev_convert_signal_number(WSTOPSIG(status)));
   }
   else {
-    st = alloc_small(1, TAG_WSIGNALED);
+    st = caml_alloc_small(1, TAG_WSIGNALED);
     Field(st, 0) = Val_int(caml_rev_convert_signal_number(WTERMSIG(status)));
   }
   return st;
@@ -664,7 +681,7 @@ value lwt_unix_wait4(value flags, value pid_req)
   caml_leave_blocking_section();
   if (pid == -1) uerror("wait4", Nothing);
 
-  times = alloc_small(2 * Double_wosize, Double_array_tag);
+  times = caml_alloc_small(2 * Double_wosize, Double_array_tag);
   Store_double_field(times, 0, ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6);
   Store_double_field(times, 1, ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6);
 
@@ -777,6 +794,9 @@ CAMLprim value lwt_unix_guess_blocking_job(value val_fd)
    | JOB: wait_mincore                                               |
    +-----------------------------------------------------------------+ */
 
+#ifdef __CYGWIN__
+LWT_NOT_AVAILABLE2(unix_wait_mincore_job)
+#else
 struct job_wait_mincore {
   struct lwt_unix_job job;
   char *ptr;
@@ -801,6 +821,7 @@ CAMLprim value lwt_unix_wait_mincore_job(value val_buffer, value val_offset)
   job->ptr = (char*)Caml_ba_data_val(val_buffer) + Long_val(val_offset);
   return lwt_unix_alloc_job(&(job->job));
 }
+#endif
 
 /* +-----------------------------------------------------------------+
    | JOB: open                                                       |
@@ -832,8 +853,23 @@ static int open_flag_table[] = {
   O_DSYNC,
   O_SYNC,
   O_RSYNC,
+  0,
+#ifdef O_CLOEXEC
+  O_CLOEXEC
+#else
+#define NEED_CLOEXEC_EMULATION
   0
+#endif
 };
+
+#ifdef NEED_CLOEXEC_EMULATION
+static int open_cloexec_table[14] = {
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0,
+  0,
+  1
+};
+#endif
 
 struct job_open {
   struct lwt_unix_job job;
@@ -850,6 +886,18 @@ static void worker_open(struct job_open *job)
 {
   int fd;
   fd = open(job->name, job->flags, job->perms);
+#if defined(NEED_CLOEXEC_EMULATION) && defined(FD_CLOEXEC)
+  if (fd >= 0 && job->fd) {
+    int flags = fcntl(fd, F_GETFD, 0);
+    if (flags == -1 ||
+        fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == -1) {
+      int serrno = errno;
+      close(fd);
+      errno = serrno;
+      fd = -1;
+    }
+  }
+#endif
   job->fd = fd;
   job->error_code = errno;
   if (fd >= 0) {
@@ -875,7 +923,10 @@ static value result_open(struct job_open *job)
 CAMLprim value lwt_unix_open_job(value name, value flags, value perms)
 {
   LWT_UNIX_INIT_JOB_STRING(job, open, 0, name);
-  job->flags = convert_flag_list(flags, open_flag_table);
+#ifdef NEED_CLOEXEC_EMULATION
+  job->fd = caml_convert_flag_list(flags, open_cloexec_table) != 0;
+#endif
+  job->flags = caml_convert_flag_list(flags, open_flag_table);
   job->perms = Int_val(perms);
   return lwt_unix_alloc_job(&(job->job));
 }
@@ -1070,11 +1121,14 @@ static value copy_stat(int use_64, struct stat *buf)
   CAMLparam0();
   CAMLlocal5(atime, mtime, ctime, offset, v);
 
-  atime = copy_double((double) buf->st_atime + (NANOSEC(buf, a) / 1000000000.0));
-  mtime = copy_double((double) buf->st_mtime + (NANOSEC(buf, m) / 1000000000.0));
-  ctime = copy_double((double) buf->st_ctime + (NANOSEC(buf, c) / 1000000000.0));
+  atime =
+    caml_copy_double((double) buf->st_atime + (NANOSEC(buf, a) / 1000000000.0));
+  mtime =
+    caml_copy_double((double) buf->st_mtime + (NANOSEC(buf, m) / 1000000000.0));
+  ctime =
+    caml_copy_double((double) buf->st_ctime + (NANOSEC(buf, c) / 1000000000.0));
   offset = use_64 ? caml_copy_int64(buf->st_size) : Val_int(buf->st_size);
-  v = alloc_small(12, 0);
+  v = caml_alloc_small(12, 0);
   Field(v, 0) = Val_int (buf->st_dev);
   Field(v, 1) = Val_int (buf->st_ino);
   switch (buf->st_mode & S_IFMT) {
@@ -1248,6 +1302,55 @@ CAMLprim value lwt_unix_fstat_64_job(value val_fd)
 }
 
 /* +-----------------------------------------------------------------+
+   | JOB: utimes                                                     |
+   +-----------------------------------------------------------------+ */
+
+struct job_utimes {
+    struct lwt_unix_job job;
+    char *path;
+    const struct timeval *times_pointer;
+    struct timeval times[2];
+    int result;
+    int error_code;
+    char data[];
+};
+
+static void worker_utimes(struct job_utimes *job)
+{
+    job->result = utimes(job->path, job->times_pointer);
+    job->error_code = errno;
+}
+
+static value result_utimes(struct job_utimes *job)
+{
+    LWT_UNIX_CHECK_JOB_ARG(job, job->result != 0, "utimes", job->path);
+    lwt_unix_free_job(&job->job);
+    return Val_unit;
+}
+
+CAMLprim value lwt_unix_utimes_job(value path, value val_atime, value val_mtime)
+{
+    LWT_UNIX_INIT_JOB_STRING(job, utimes, 0, path);
+
+    double  atime = Double_val(val_atime);
+    double  mtime = Double_val(val_mtime);
+
+    if (atime == 0.0 && mtime == 0.0)
+        job->times_pointer = NULL;
+    else {
+        job->times[0].tv_sec = atime;
+        job->times[0].tv_usec = (atime - job->times[0].tv_sec) * 1000000;
+
+        job->times[1].tv_sec = mtime;
+        job->times[1].tv_usec = (mtime - job->times[1].tv_sec) * 1000000;
+
+        job->times_pointer = job->times;
+    }
+
+    return lwt_unix_alloc_job(&(job->job));
+}
+
+/* +-----------------------------------------------------------------+
    | JOB: isatty                                                     |
    +-----------------------------------------------------------------+ */
 
@@ -1340,6 +1443,22 @@ CAMLprim value lwt_unix_closedir_job(value dir)
   return lwt_unix_alloc_job(&job->job);
 }
 
+/* Directory handle validity. */
+
+CAMLprim value lwt_unix_valid_dir(value dir)
+{
+    CAMLparam1(dir);
+    int result = DIR_Val(dir) == NULL ? 0 : 1;
+    CAMLreturn(Val_int(result));
+}
+
+CAMLprim value lwt_unix_invalidate_dir(value dir)
+{
+    CAMLparam1(dir);
+    DIR_Val(dir) = NULL;
+    CAMLreturn(Val_unit);
+}
+
 /* +-----------------------------------------------------------------+
    | JOB: rewinddir                                                  |
    +-----------------------------------------------------------------+ */
@@ -1367,6 +1486,24 @@ CAMLprim value lwt_unix_rewinddir_job(value dir)
   return lwt_unix_alloc_job(&(job->job));
 }
 
+/* struct dirent size */
+
+/* Some kind of estimate of the true size of a dirent structure, including the
+   space used for the name. This is controversial, and there is an ongoing
+   discussion (see Internet) about deprecating readdir_r because of the need to
+   guess the size in this way. */
+static size_t dirent_size(DIR *dir)
+{
+    size_t size =
+        offsetof(struct dirent, d_name) +
+        fpathconf(dirfd(dir), _PC_NAME_MAX) + 1;
+
+    if (size < sizeof(struct dirent))
+        size = sizeof(struct dirent);
+
+    return size;
+}
+
 /* +-----------------------------------------------------------------+
    | JOB: readdir                                                    |
    +-----------------------------------------------------------------+ */
@@ -1381,7 +1518,7 @@ struct job_readdir {
 
 static void worker_readdir(struct job_readdir *job)
 {
-  job->entry = lwt_unix_malloc(offsetof(struct dirent, d_name) + fpathconf(dirfd(job->dir), _PC_NAME_MAX) + 1);
+  job->entry = lwt_unix_malloc(dirent_size(job->dir));
   job->result = readdir_r(job->dir, job->entry, &job->ptr);
 }
 
@@ -1420,37 +1557,25 @@ struct job_readdir_n {
   DIR *dir;
   long count;
   int error_code;
-  struct dirent *entries[];
+  struct dirent entries[];
 };
 
 static void worker_readdir_n(struct job_readdir_n *job)
 {
-  size_t size = offsetof(struct dirent, d_name) + fpathconf(dirfd(job->dir), _PC_NAME_MAX) + 1;
   long i;
   for(i = 0; i < job->count; i++) {
     struct dirent *ptr;
-    struct dirent *entry = (struct dirent *)lwt_unix_malloc(size);
-
-    int result = readdir_r(job->dir, entry, &ptr);
+    int result = readdir_r(job->dir, &job->entries[i], &ptr);
 
     /* An error happened. */
     if (result != 0) {
-      /* Free already read entries. */
-      free(entry);
-      long j;
-      for(j = 0; j < i; j++) free(job->entries[j]);
-      /* Return an error. */
       job->error_code = result;
       return;
     }
 
     /* End of directory reached */
-    if (ptr == NULL) {
-      free(entry);
+    if (ptr == NULL)
       break;
-    }
-
-    job->entries[i] = entry;
   }
 
   job->count = i;
@@ -1469,9 +1594,9 @@ static value result_readdir_n(struct job_readdir_n *job)
     result = caml_alloc(job->count, 0);
     long i;
     for(i = 0; i < job->count; i++) {
-      Store_field(result, i, caml_copy_string(job->entries[i]->d_name));
-      free(job->entries[i]);
+      Store_field(result, i, caml_copy_string(job->entries[i].d_name));
     }
+    lwt_unix_free_job(&job->job);
     CAMLreturn(result);
   }
 }
@@ -1479,9 +1604,12 @@ static value result_readdir_n(struct job_readdir_n *job)
 CAMLprim value lwt_unix_readdir_n_job(value val_dir, value val_count)
 {
   long count = Long_val(val_count);
-  LWT_UNIX_INIT_JOB(job, readdir_n, sizeof(struct dirent*) * count);
-  job->dir = DIR_Val(val_dir);
+  DIR *dir = DIR_Val(val_dir);
+
+  LWT_UNIX_INIT_JOB(job, readdir_n, dirent_size(dir) * count);
+  job->dir = dir;
   job->count = count;
+
   return lwt_unix_alloc_job(&job->job);
 }
 
@@ -1694,16 +1822,16 @@ static value alloc_passwd_entry(struct passwd *entry)
   value dir = Val_unit, shell = Val_unit;
 
   Begin_roots5 (name, passwd, gecos, dir, shell);
-    name = copy_string(entry->pw_name);
-    passwd = copy_string(entry->pw_passwd);
+    name = caml_copy_string(entry->pw_name);
+    passwd = caml_copy_string(entry->pw_passwd);
 #if !defined(__BEOS__)
-    gecos = copy_string(entry->pw_gecos);
+    gecos = caml_copy_string(entry->pw_gecos);
 #else
-    gecos = copy_string("");
+    gecos = caml_copy_string("");
 #endif
-    dir = copy_string(entry->pw_dir);
-    shell = copy_string(entry->pw_shell);
-    res = alloc_small(7, 0);
+    dir = caml_copy_string(entry->pw_dir);
+    shell = caml_copy_string(entry->pw_shell);
+    res = caml_alloc_small(7, 0);
     Field(res, 0) = name;
     Field(res, 1) = passwd;
     Field(res, 2) = Val_int(entry->pw_uid);
@@ -1721,10 +1849,10 @@ static value alloc_group_entry(struct group *entry)
   value name = Val_unit, pass = Val_unit, mem = Val_unit;
 
   Begin_roots3 (name, pass, mem);
-    name = copy_string(entry->gr_name);
-    pass = copy_string(entry->gr_passwd);
-    mem = copy_string_array((const char**)entry->gr_mem);
-    res = alloc_small(4, 0);
+    name = caml_copy_string(entry->gr_name);
+    pass = caml_copy_string(entry->gr_passwd);
+    mem = caml_copy_string_array((const char**)entry->gr_mem);
+    res = caml_alloc_small(4, 0);
     Field(res, 0) = name;
     Field(res, 1) = pass;
     Field(res, 2) = Val_int(entry->gr_gid);
@@ -1985,18 +2113,20 @@ static value alloc_host_entry(struct hostent *entry)
   value addr_list = Val_unit, adr = Val_unit;
 
   Begin_roots4 (name, aliases, addr_list, adr);
-    name = copy_string((char *)(entry->h_name));
+    name = caml_copy_string((char *)(entry->h_name));
     /* PR#4043: protect against buggy implementations of gethostbynamee()
        that return a NULL pointer in h_aliases */
     if (entry->h_aliases)
-      aliases = copy_string_array((const char**)entry->h_aliases);
+      aliases = caml_copy_string_array((const char**)entry->h_aliases);
     else
       aliases = Atom(0);
     if (entry->h_length == 16)
-      addr_list = alloc_array(alloc_one_addr6, (const char**)entry->h_addr_list);
+      addr_list =
+        caml_alloc_array(alloc_one_addr6, (const char**)entry->h_addr_list);
     else
-      addr_list = alloc_array(alloc_one_addr, (const char**)entry->h_addr_list);
-    res = alloc_small(4, 0);
+      addr_list =
+        caml_alloc_array(alloc_one_addr, (const char**)entry->h_addr_list);
+    res = caml_alloc_small(4, 0);
     Field(res, 0) = name;
     Field(res, 1) = aliases;
     switch (entry->h_addrtype) {
@@ -2048,7 +2178,7 @@ hostent_dup(struct hostent *orig)
 nomem3:
   c_free_string_array(h->h_aliases);
 nomem2:
-  free(h->h_name);
+  free((char*)h->h_name);
 nomem1:
   free(h);
   return NULL;
@@ -2060,7 +2190,7 @@ hostent_free(struct hostent *h)
   if ( h ){
     c_free_string_array(h->h_addr_list);
     c_free_string_array(h->h_aliases);
-    free(h->h_name);
+    free((char*)h->h_name);
     free(h);
   }
 }
@@ -2173,9 +2303,9 @@ static value alloc_protoent(struct protoent *entry)
   value name = Val_unit, aliases = Val_unit;
 
   Begin_roots2 (name, aliases);
-    name = copy_string(entry->p_name);
-    aliases = copy_string_array((const char**)entry->p_aliases);
-    res = alloc_small(3, 0);
+    name = caml_copy_string(entry->p_name);
+    aliases = caml_copy_string_array((const char**)entry->p_aliases);
+    res = caml_alloc_small(3, 0);
     Field(res,0) = name;
     Field(res,1) = aliases;
     Field(res,2) = Val_int(entry->p_proto);
@@ -2189,10 +2319,10 @@ static value alloc_servent(struct servent *entry)
   value name = Val_unit, aliases = Val_unit, proto = Val_unit;
 
   Begin_roots3 (name, aliases, proto);
-    name = copy_string(entry->s_name);
-    aliases = copy_string_array((const char**)entry->s_aliases);
-    proto = copy_string(entry->s_proto);
-    res = alloc_small(4, 0);
+    name = caml_copy_string(entry->s_name);
+    aliases = caml_copy_string_array((const char**)entry->s_aliases);
+    proto = caml_copy_string(entry->s_proto);
+    res = caml_alloc_small(4, 0);
     Field(res,0) = name;
     Field(res,1) = aliases;
     Field(res,2) = Val_int(ntohs(entry->s_port));
@@ -2441,8 +2571,8 @@ static value convert_addrinfo(struct addrinfo * a)
   if (len > sizeof(sa)) len = sizeof(sa);
   memcpy(&sa.s_gen, a->ai_addr, len);
   vaddr = alloc_sockaddr(&sa, len, -1);
-  vcanonname = copy_string(a->ai_canonname == NULL ? "" : a->ai_canonname);
-  vres = alloc_small(5, 0);
+  vcanonname = caml_copy_string(a->ai_canonname == NULL ? "" : a->ai_canonname);
+  vres = caml_alloc_small(5, 0);
   Field(vres, 0) = cst_to_constr(a->ai_family, socket_domain_table, 3, 0);
   Field(vres, 1) = cst_to_constr(a->ai_socktype, socket_type_table, 4, 0);
   Field(vres, 2) = Val_int(a->ai_protocol);
@@ -2558,7 +2688,7 @@ CAMLprim value lwt_unix_getnameinfo_job(value sockaddr, value opts)
 {
   LWT_UNIX_INIT_JOB(job, getnameinfo, 0);
   get_sockaddr(sockaddr, &job->addr, &job->addr_len);
-  job->opts = convert_flag_list(opts, getnameinfo_flag_table);
+  job->opts = caml_convert_flag_list(opts, getnameinfo_flag_table);
   return lwt_unix_alloc_job(&job->job);
 }
 

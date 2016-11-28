@@ -5,6 +5,10 @@
 #
 # Generic Makefile for oasis project
 
+# Suppress duplicate topdirs.cmi warnings.
+OCAMLFIND_IGNORE_DUPS_IN = $(shell ocamlfind query compiler-libs)
+export OCAMLFIND_IGNORE_DUPS_IN
+
 # Set to setup.exe for the release
 SETUP := setup-dev.exe
 
@@ -22,6 +26,8 @@ setup-dev.exe: _oasis setup.ml
 setup.exe: setup.ml
 	ocamlopt.opt -o $@ $< || ocamlopt -o $@ $< || ocamlc -o $@ $<
 	rm -f setup.cmx setup.cmi setup.o setup.obj setup.cmo
+
+setup: $(SETUP)
 
 build: $(SETUP) setup.data
 	./$(SETUP) -build $(BUILDFLAGS)
@@ -52,6 +58,7 @@ clean: $(SETUP)
 
 distclean: $(SETUP)
 	./$(SETUP) -distclean $(DISTCLEANFLAGS)
+	rm -rf setup*.exe
 
 configure: $(SETUP)
 	./$(SETUP) -configure $(CONFIGUREFLAGS)
@@ -59,4 +66,4 @@ configure: $(SETUP)
 setup.data: $(SETUP)
 	./$(SETUP) -configure $(CONFIGUREFLAGS)
 
-.PHONY: default build doc test all install uninstall reinstall clean distclean configure
+.PHONY: default setup build doc test all install uninstall reinstall clean distclean configure

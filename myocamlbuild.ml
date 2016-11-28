@@ -45,9 +45,11 @@ let split str =
   in
   skip_spaces 0
 
+let c_library_tag name = Printf.sprintf "use_C_%s" name
+
 let define_c_library name env =
   if BaseEnvLight.var_get name env = "true" then begin
-    let tag = Printf.sprintf "use_C_%s" name in
+    let tag = c_library_tag name in
 
     let opt = List.map (fun x -> A x) (split (BaseEnvLight.var_get (name ^ "_opt") env))
     and lib = List.map (fun x -> A x) (split (BaseEnvLight.var_get (name ^ "_lib") env)) in
@@ -63,6 +65,16 @@ let define_c_library name env =
     flag ["link"; "ocaml"; tag] & S (List.map (fun arg -> S[A"-cclib"; arg]) lib)
   end
 
+let conditional_warnings_as_errors () =
+  match Sys.getenv "LWT_WARNINGS_AS_ERRORS" with
+  | "yes" ->
+    let flags = S [A "-warn-error"; A "+A"] in
+    flag ["ocaml"; "compile"] flags;
+    flag ["ocaml"; "link"] flags
+
+  | _ -> ()
+  | exception Not_found -> ()
+
 let () =
   dispatch
     (fun hook ->
@@ -72,7 +84,12 @@ let () =
              Options.make_links := false
 
          | After_rules ->
-             let env = BaseEnvLight.load ~allow_empty:true ~filename:MyOCamlbuildBase.env_filename () in
+             let env =
+               BaseEnvLight.load
+                 ~allow_empty:true
+                 ~filename:(Pathname.basename BaseEnvLight.default_filename)
+                 ()
+             in
 
              (* Determine extension of CompiledObject: best *)
              let native_suffix =
@@ -83,7 +100,7 @@ let () =
              (* Internal syntax extension *)
              List.iter
                (fun base ->
-                  let tag = "pa_" ^ base and file = "syntax/pa_" ^ base ^ ".cmo" in
+                  let tag = "pa_" ^ base and file = "src/camlp4/pa_" ^ base ^ ".cmo" in
                   flag ["ocaml"; "compile"; tag] & S[A"-ppopt"; A file];
                   flag ["ocaml"; "ocamldep"; tag] & S[A"-ppopt"; A file];
                   flag ["ocaml"; "doc"; tag] & S[A"-ppopt"; A file];
@@ -91,12 +108,12 @@ let () =
                ["lwt_options"; "lwt"; "lwt_log"];
 
              flag ["ocaml"; "compile"; "ppx_lwt"] &
-              S [A "-ppx"; A ("ppx/ppx_lwt_ex." ^ native_suffix)];
+              S [A "-ppx"; A ("src/ppx/ppx_lwt_ex." ^ native_suffix)];
 
              (* Use an introduction page with categories *)
              tag_file "lwt-api.docdir/index.html" ["apiref"];
-             dep ["apiref"] ["apiref-intro"];
-             flag ["apiref"] & S[A "-intro"; P "apiref-intro"; A"-colorize-code"];
+             dep ["apiref"] ["doc/apiref-intro"];
+             flag ["apiref"] & S[A "-intro"; P "doc/apiref-intro"; A"-colorize-code"];
 
              (* Stubs: *)
              dep ["file:src/unix/lwt_unix_stubs.c"] ["src/unix/lwt_unix_unix.c"; "src/unix/lwt_unix_windows.c"];
@@ -104,13 +121,17 @@ let () =
              (* Check for "unix" because other variables are not
                 present in the setup.data file if lwt.unix is
                 disabled. *)
-             if BaseEnvLight.var_get "unix" env = "true" then begin
-               define_c_library "glib" env;
-               define_c_library "libev" env;
-               define_c_library "pthread" env;
+             let c_libraries = ["glib"; "libev"; "pthread"] in
 
+             if BaseEnvLight.var_get "unix" env = "true" then begin
+               List.iter (fun name -> define_c_library name env) c_libraries;
                flag ["c"; "compile"; "use_lwt_headers"] & S [A"-ccopt"; A"-Isrc/unix"];
-             end
+             end;
+
+             List.iter (fun name ->
+               mark_tag_used (c_library_tag name)) c_libraries;
+
+             conditional_warnings_as_errors ()
 
          | _ ->
              ())
@@ -129,7 +150,7 @@ let ocamldoc_wiki tags deps docout docdir =
 let () =
   try
     let wikidoc_dir =
-      let base = Ocamlbuild_pack.My_unix.run_and_read "ocamlfind query wikidoc" in
+      let base = Ocamlbuild_pack.My_unix.run_and_read "ocamlfind query wikidoc 2> /dev/null" in
       String.sub base 0 (String.length base - 1)
     in
 

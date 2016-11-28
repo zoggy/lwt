@@ -200,7 +200,8 @@ let fdatasync_code = "
 
 CAMLprim value lwt_test(value Unit)
 {
-  fdatasync(0);
+  int (*fdatasyncp)(int) = fdatasync;
+  fdatasyncp(0);
   return Val_unit;
 }
 "
@@ -230,6 +231,10 @@ CAMLprim value lwt_test(value Unit)
   he = gethostbyaddr_r((const char *)NULL, (int)0, (int)0,(struct hostent *)NULL, (char *)NULL, (int)0, (struct hostent **)NULL,(int *)NULL);
   se = getservbyname_r((const char *)NULL, (const char *)NULL,(struct servent *)NULL, (char *)NULL, (int)0, (struct servent **)NULL);
   se = getservbyport_r((int)0, (const char *)NULL,(struct servent *)NULL, (char *)NULL, (int)0, (struct servent **)NULL);
+  pr = getprotoent_r((struct protoent *)NULL, (char *)NULL, (int)0, (struct protoent **)NULL);
+  pr = getprotobyname_r((const char *)NULL, (struct protoent *)NULL, (char *)NULL, (int)0, (struct protoent **)NULL);
+  pr = getprotobynumber_r((int)0, (struct protoent *)NULL, (char *)NULL, (int)0, (struct protoent **)NULL);
+
   return Val_unit;
 }
 "
@@ -275,6 +280,18 @@ CAMLprim value lwt_test() {
   m = (double)NANOSEC(buf, m);
   c = (double)NANOSEC(buf, c);
   return Val_unit;
+}
+"
+
+let bsd_mincore_code = "
+#include <unistd.h>
+#include <sys/mman.h>
+#include <caml/mlvalues.h>
+
+CAMLprim value lwt_test()
+{
+    int (*mincore_ptr)(const void*, size_t, char*) = mincore;
+    return Val_int(mincore_ptr == mincore_ptr);
 }
 "
 
@@ -553,13 +570,7 @@ let () =
   let test_pthread () =
     let opt, lib =
       if !android_target then ([], []) else
-      lib_flags "PTHREAD"
-        (fun () ->
-          match search_header "pthread.h" with
-            | Some (dir_i, dir_l) ->
-                (["-I" ^ dir_i], ["-L" ^ dir_l; "-lpthread"])
-            | None ->
-                ([], ["-lpthread"]))
+      lib_flags "PTHREAD" (fun () -> ([], ["-lpthread"]))
     in
     setup_data := ("pthread_opt", opt) :: ("pthread_lib", lib) :: !setup_data;
     test_code (opt, lib) pthread_code
@@ -608,18 +619,19 @@ let () =
   if !not_available <> [] then begin
     if not have_pkg_config then
       printf "Warning: the 'pkg-config' command is not available.";
+    (* The missing library list should be printed on the last line, to avoid
+       being trimmed by OPAM. The whole message should be kept to 10 lines. See
+       https://github.com/ocsigen/lwt/issues/271. *)
     printf "
-The following recquired C libraries are missing: %s.
-Please install them and retry. If they are installed in a non-standard location
-or need special flags, set the environment variables <LIB>_CFLAGS and <LIB>_LIBS
-accordingly and retry.
+Some required C libraries were not found. If a C library <lib> is installed in a
+non-standard location, set <LIB>_CFLAGS and <LIB>_LIBS accordingly. You may also
+try 'ocaml setup.ml -configure --disable-<lib>' to avoid compiling support for
+it. For example, in the case of libev missing:
+    export LIBEV_CFLAGS=-I/opt/local/include
+    export LIBEV_LIBS='-L/opt/local/lib -lev'
+    (* or: *)  ocaml setup.ml -configure --disable-libev
 
-For example, if libev is installed in /opt/local, you can type:
-
-export LIBEV_CFLAGS=-I/opt/local/include
-export LIBEV_LIBS=-L/opt/local/lib
-
-To compile without libev support, use ./configure --disable-libev ...
+Missing C libraries: %s
 " (String.concat ", " !not_available);
     exit 1
   end;
@@ -652,6 +664,8 @@ Lwt can use pthread or the win32 API.
     "netdb_reentrant" "HAVE_NETDB_REENTRANT" (fun () -> test_code ([], []) netdb_reentrant_code);
   test_feature ~do_check "reentrant gethost*" "HAVE_REENTRANT_HOSTENT" (fun () -> test_code ([], []) hostent_reentrant_code);
   test_nanosecond_stat ();
+  test_feature ~do_check "BSD mincore" "HAVE_BSD_MINCORE" (fun () ->
+    test_code (["-Werror"], []) bsd_mincore_code);
 
   let get_cred_vars = [
     "HAVE_GET_CREDENTIALS_LINUX";
@@ -744,4 +758,3 @@ Lwt can use pthread or the win32 API.
   (* Generate stubs. *)
   print_endline "Generating C stubs...";
   exit (Sys.command "ocaml src/unix/gen_stubs.ml")
-

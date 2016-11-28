@@ -41,7 +41,7 @@ let is_on switch =
 
 let check = function
   | Some{ state = St_off } -> raise Off
-  | _ -> ()
+  | Some {state = St_on _} | None -> ()
 
 let add_hook switch hook =
   match switch with
@@ -66,6 +66,12 @@ let turn_off switch =
   match switch.state with
     | St_on { hooks = hooks } ->
         switch.state <- St_off;
-        Lwt_list.iter_p (fun hook -> Lwt.apply hook ()) hooks
+        Lwt.join (List.map (fun hook -> Lwt.apply hook ()) hooks)
     | St_off ->
         Lwt.return_unit
+
+let with_switch fn =
+  let switch = create () in
+  Lwt.finalize
+    (fun () -> fn switch)
+    (fun () -> turn_off switch)

@@ -101,14 +101,13 @@ type 'a source =
 type 'a t = {
   source : 'a source;
   (* The source of the stream. *)
+  close : unit Lwt.u;
+  (* A waiter for a thread that sleeps until the stream is closed. *)
   mutable node : 'a node;
   (* Pointer to first pending element, or to [last] if there is no
      pending element. *)
   last : 'a node ref;
   (* Node marking the end of the queue of pending elements. *)
-  hooks : (unit -> unit) list ref;
-  (* Functions called when the end of stream is reached. Hooks are
-     shared between all clones. *)
 }
 
 class type ['a] bounded_push = object
@@ -127,34 +126,49 @@ end
 let clone s =
   (match s.source with
      | Push_bounded _ -> invalid_arg "Lwt_stream.clone"
-     | _ -> ());
+     | From _ | From_direct _ | Push _ -> ());
   {
     source = s.source;
+    close = s.close;
     node = s.node;
     last = s.last;
-    hooks = s.hooks;
+  }
+
+let from_source source =
+  let last = new_node () in
+  let _, close = Lwt.wait () in
+  { source = source
+  ; close = close
+  ; node = last
+  ; last = ref last
   }
 
 let from f =
-  let last = new_node () in
-  {
-    source = From { from_create = f; from_thread = Lwt.return_unit };
-    node = last;
-    last = ref last;
-    hooks = ref [];
-  }
+  from_source (From { from_create = f; from_thread = Lwt.return_unit })
 
 let from_direct f =
-  let last = new_node () in
-  {
-    source = From_direct f;
-    node = last;
-    last = ref last;
-    hooks = ref [];
-  }
+  from_source (From_direct f)
 
-let on_terminate s f =
-  s.hooks := f :: !(s.hooks)
+let closed s =
+  Lwt.waiter_of_wakener s.close
+
+let is_closed s =
+  not (Lwt.is_sleeping (closed s))
+
+let on_termination s f =
+  Lwt.async (fun () -> closed s >|= f)
+
+let on_terminate = on_termination
+
+let enqueue' e last =
+  let node = !last and new_last = new_node () in
+  node.data <- e;
+  node.next <- new_last;
+  last := new_last
+;;
+
+let enqueue e s =
+  enqueue' e s.last
 
 let of_list l =
   let l = ref l in
@@ -189,8 +203,6 @@ let of_string s =
        end)
 
 let create_with_reference () =
-  (* Create the cell pointing to the end of the queue. *)
-  let last = ref (new_node ()) in
   (* Create the source for notifications of new elements. *)
   let source, wakener_cell =
     let waiter, wakener = Lwt.wait () in
@@ -199,18 +211,16 @@ let create_with_reference () =
        push_external = Obj.repr () },
      ref wakener)
   in
-  (* Set to [true] when the end-of-stream is sent. *)
-  let closed = ref false in
-  let hooks = ref [] in
+  let t = from_source (Push source) in
+  (* [push] should not close over [t] so that it can be garbage collected even
+   * there are still references to [push]. Unpack all the components of [t]
+   * that [push] needs and reference those identifiers instead. *)
+  let close = t.close and last = t.last in
   (* The push function. It does not keep a reference to the stream. *)
   let push x =
-    if !closed then raise Closed;
-    if x = None then closed := true;
+    if not (Lwt.is_sleeping (Lwt.waiter_of_wakener close)) then raise Closed;
     (* Push the element at the end of the queue. *)
-    let node = !last and new_last = new_node () in
-    node.data <- x;
-    node.next <- new_last;
-    last := new_last;
+    enqueue' x last;
     (* Send a signal if at least one thread is waiting for a new
        element. *)
     if source.push_waiting then begin
@@ -225,14 +235,9 @@ let create_with_reference () =
     end;
     (* Do this at the end in case one of the function raise an
        exception. *)
-    if x = None then List.iter (fun f -> f ()) !hooks
+    if x = None then Lwt.wakeup close ()
   in
-  ({ source = Push source;
-     node = !last;
-     last = last;
-     hooks = hooks },
-   push,
-   fun x -> source.push_external <- Obj.repr x)
+  (t, push, fun x -> source.push_external <- Obj.repr x)
 
 let create () =
   let source, push, _ = create_with_reference () in
@@ -245,10 +250,7 @@ let create () =
    This does not modify info.pushb_count. *)
 let notify_pusher info last =
   (* Push the element at the end of the queue. *)
-  let node = !last and new_last = new_node () in
-  node.data <- info.pushb_pending;
-  node.next <- new_last;
-  last := new_last;
+  enqueue' info.pushb_pending last;
   (* Clear pending element. *)
   info.pushb_pending <- None;
   (* Wakeup the pusher. *)
@@ -258,7 +260,7 @@ let notify_pusher info last =
   info.pushb_push_wakener <- wakener;
   Lwt.wakeup_later old_wakener ()
 
-class ['a] bounded_push_impl (info : 'a push_bounded) wakener_cell last hooks = object
+class ['a] bounded_push_impl (info : 'a push_bounded) wakener_cell last close = object
   val mutable closed = false
 
   method size =
@@ -293,10 +295,7 @@ class ['a] bounded_push_impl (info : 'a push_bounded) wakener_cell last hooks = 
                  Lwt.fail exn)
     end else begin
       (* Push the element at the end of the queue. *)
-      let node = !last and new_last = new_node () in
-      node.data <- Some x;
-      node.next <- new_last;
-      last := new_last;
+      enqueue' (Some x) last;
       info.pushb_count <- info.pushb_count + 1;
       (* Send a signal if at least one thread is waiting for a new
          element. *)
@@ -324,7 +323,15 @@ class ['a] bounded_push_impl (info : 'a push_bounded) wakener_cell last hooks = 
         info.pushb_pending <- None;
         Lwt.wakeup_later_exn info.pushb_push_wakener Closed
       end;
-      List.iter (fun f -> f ()) !hooks
+      (* Send a signal if at least one thread is waiting for a new
+         element. *)
+      if info.pushb_waiting then begin
+        info.pushb_waiting <- false;
+        let old_wakener = !wakener_cell in
+        (* Signal that a new value has been received. *)
+        Lwt.wakeup_later old_wakener ()
+      end;
+      Lwt.wakeup close ();
     end
 
   method count =
@@ -342,9 +349,6 @@ end
 
 let create_bounded size =
   if size < 0 then invalid_arg "Lwt_stream.create_bounded";
-  (* Create the cell pointing to the end of the queue. *)
-  let last = ref (new_node ()) in
-  let hooks = ref [] in
   (* Create the source for notifications of new elements. *)
   let info, wakener_cell =
     let waiter, wakener = Lwt.wait () in
@@ -359,11 +363,8 @@ let create_bounded size =
        pushb_external = Obj.repr () },
      ref wakener)
   in
-  ({ source = Push_bounded info;
-     node = !last;
-     last = last;
-     hooks = hooks },
-   new bounded_push_impl info wakener_cell last hooks)
+  let t = from_source (Push_bounded info) in
+  (t, new bounded_push_impl info wakener_cell t.last t.close)
 
 (* Wait for a new element to be added to the queue of pending element
    of the stream. *)
@@ -379,11 +380,8 @@ let feed s =
           let thread =
             from.from_create () >>= fun x ->
             (* Push the element to the end of the queue. *)
-            let node = !(s.last) and new_last = new_node () in
-            node.data <- x;
-            node.next <- new_last;
-            s.last := new_last;
-            if x = None then List.iter (fun f -> f ()) !(s.hooks);
+            enqueue x s;
+            if x = None then Lwt.wakeup s.close ();
             Lwt.return_unit
           in
           (* Allow other threads to access this thread. *)
@@ -393,11 +391,8 @@ let feed s =
     | From_direct f ->
         let x = f () in
         (* Push the element to the end of the queue. *)
-        let node = !(s.last) and new_last = new_node () in
-        node.data <- x;
-        node.next <- new_last;
-        s.last := new_last;
-        if x = None then List.iter (fun f -> f ()) !(s.hooks);
+        enqueue x s;
+        if x = None then Lwt.wakeup s.close ();
         Lwt.return_unit
     | Push push ->
         push.push_waiting <- true;
@@ -420,7 +415,7 @@ let consume s node =
             info.pushb_count <- info.pushb_count - 1
           else
             notify_pusher info s.last
-      | _ ->
+      | From _ | From_direct _ | Push _ ->
           ()
   end
 
@@ -461,7 +456,9 @@ let rec get_exn_rec s node =
     Lwt.try_bind
       (fun () -> feed s)
       (fun () -> get_exn_rec s node)
-      (fun exn -> Lwt.return (Some (Error exn)))
+      (fun exn -> Lwt.return (Some (Error exn : _ result)))
+      (* TODO: Eliminate the above type constraint once the Lwt_stream.result
+         type is eliminated. *)
   else
     match node.data with
       | Some value ->
@@ -560,7 +557,7 @@ let last_new s =
     match Lwt.state thread with
       | Lwt.Return x ->
           last_new_rec node x s
-      | _ ->
+      | Lwt.Fail _ | Lwt.Sleep ->
           thread
   else
     match node.data with
@@ -980,7 +977,7 @@ let rec find_map_s_rec node f s =
 
 let find_map_s f s = find_map_s_rec s.node f s
 
-let rec combine s1 s2 =
+let combine s1 s2 =
   let next () =
     let t1 = get s1 and t2 = get s2 in
     t1 >>= fun n1 ->
@@ -1042,6 +1039,7 @@ let choose streams =
                 streams := source s :: l;
                 Lwt.return x
             | None ->
+                streams := l;
                 next ()
   in
   from next
@@ -1049,7 +1047,7 @@ let choose streams =
 let parse s f =
   (match s.source with
      | Push_bounded _ -> invalid_arg "Lwt_stream.parse"
-     | _ -> ());
+     | From _ | From_direct _ | Push _ -> ());
   let node = s.node in
   Lwt.catch
     (fun () -> f s)

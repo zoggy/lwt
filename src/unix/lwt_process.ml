@@ -186,8 +186,8 @@ type state =
   | Running
   | Exited of Unix.process_status
 
-let status (pid, status, rusage) = status
-let rusage (pid, status, rusage) = rusage
+let status (_pid, status, _rusage) = status
+let rusage (_pid, _status, rusage) = rusage
 
 external cast_chan : 'a Lwt_io.channel -> unit Lwt_io.channel = "%identity"
   (* Transform a channel into a channel that only support closing. *)
@@ -196,15 +196,15 @@ let ignore_close chan = ignore (Lwt_io.close chan)
 
 class virtual common timeout proc channels =
   let wait = waitproc proc in
-  let close = lazy(Lwt.join (List.map Lwt_io.close channels) >>= fun () -> wait) in
 object(self)
+  val mutable closed = false
 
   method pid = proc.id
 
   method state =
     match Lwt.poll wait with
       | None -> Running
-      | Some (pid, status, rusage) -> Exited status
+      | Some (_pid, status, _rusage) -> Exited status
 
   method kill signum =
     if Lwt.state wait = Lwt.Sleep then
@@ -214,7 +214,13 @@ object(self)
     if Lwt.state wait = Lwt.Sleep then
       terminate proc
 
-  method close = Lwt.protected (Lazy.force close) >|= status
+  method close =
+    if closed then self#status
+    else (
+      closed <- true;
+      Lwt.protected (Lwt.join (List.map Lwt_io.close channels))
+      >>= fun () -> self#status
+    )
   method status = Lwt.protected wait >|= status
   method rusage = Lwt.protected wait >|= rusage
 
@@ -238,8 +244,8 @@ object(self)
                      Lwt.return_unit
                  | false ->
                      self#terminate;
-                     Lazy.force close >>= fun _ -> Lwt.return_unit)
-              (fun exn ->
+                     self#close >>= fun _ -> Lwt.return_unit)
+              (fun _ ->
                  (* The exception is dropped because it can be
                     obtained with self#close. *)
                  Lwt.return_unit)
@@ -332,7 +338,7 @@ let read_opt read ic =
     (function
     | Unix.Unix_error (Unix.EPIPE, _, _) | End_of_file ->
         Lwt.return_none
-    | exn -> Lwt.fail exn)
+    | exn -> Lwt.fail exn) [@ocaml.warning "-4"]
 
 let recv_chars pr =
   let ic = pr#stdout in
